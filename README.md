@@ -1,62 +1,234 @@
+<div align="center">
+
 # VeilCrawl
 
-Crawl a website once, then let an AI agent search it through small, locally redacted snippets. Phase 1 of [PRD.md](PRD.md).
+**Let AI agents search a whole website without reading it.**
 
-## Set up
+Crawl once, index locally, and answer with small, redacted snippets.
 
-Needs Node 22.18 or newer.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Node 22.18+](https://img.shields.io/badge/node-%E2%89%A5%2022.18-339933?logo=nodedotjs&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
+![Browser: Lightpanda](https://img.shields.io/badge/browser-Lightpanda-F5A623)
+![MCP server](https://img.shields.io/badge/MCP-server-6E56CF)
+![Status: early](https://img.shields.io/badge/status-early%20(v0.1)-orange)
+
+[Quick start](#quick-start) · [Tools](#tools) · [How it works](#how-it-works) · [Privacy](#privacy) · [Configuration](#configuration)
+
+</div>
+
+---
+
+## Why VeilCrawl
+
+Agents usually read websites one full page at a time. That is slow, fills the context window, and sends everything on the page to a model provider.
+
+| | Browsing page by page | VeilCrawl |
+| :--- | :--- | :--- |
+| **Finding a fact** | Open pages until it turns up | One search across every indexed page |
+| **What the model sees** | Whole pages | Ranked snippets, 250 tokens by default |
+| **Emails, keys, card numbers** | Sent as they are | Replaced on your machine with `[EMAIL_1]`, `[SECRET_1]` |
+| **Asking again** | Load the pages again | Local index, no new requests |
+
+## Quick start
+
+Requires Node.js 22.18 or newer.
+
+### 1. Install Lightpanda
+
+VeilCrawl uses [Lightpanda](https://lightpanda.io), a lightweight headless browser built for automation. You do not need Chromium.
+
+**macOS (Homebrew)**
 
 ```sh
-npm install
+brew install lightpanda-io/browser/lightpanda
+```
+
+**Linux (x86_64) and WSL2**
+
+```sh
+mkdir -p ~/.local/bin
+curl -fL -o ~/.local/bin/lightpanda https://github.com/lightpanda-io/browser/releases/download/nightly/lightpanda-x86_64-linux
+chmod a+x ~/.local/bin/lightpanda
+~/.local/bin/lightpanda version
+```
+
+Other platforms: see the [Lightpanda nightly builds](https://github.com/lightpanda-io/browser/releases/tag/nightly).
+
+<details>
+<summary><b>Prefer Chromium?</b></summary>
+
+Skip the step above and run this after `npm install`. VeilCrawl uses Chromium when Lightpanda is not installed.
+
+```sh
 npx playwright install chromium --only-shell
+```
+
+</details>
+
+### 2. Install VeilCrawl
+
+```sh
+git clone https://github.com/Baimmmss/veilcrawl.git
+cd veilcrawl
+npm install
 npm run build
 ```
 
-## Use from an agent (MCP)
+### 3. Connect an agent
 
-Claude Code:
+**Claude Code**
 
 ```sh
 claude mcp add --scope user veilcrawl -- node "$PWD/dist/cli.js" mcp
 ```
 
-Other clients:
+<details>
+<summary><b>Cursor, Claude Desktop and other MCP clients</b></summary>
 
 ```json
-{ "mcpServers": { "veilcrawl": { "command": "node", "args": ["/absolute/path/to/dist/cli.js", "mcp"] } } }
+{
+  "mcpServers": {
+    "veilcrawl": {
+      "command": "node",
+      "args": ["/absolute/path/to/veilcrawl/dist/cli.js", "mcp"]
+    }
+  }
+}
 ```
 
-Large crawls can outlast an MCP client's timeout. Crawl from the command line instead and give the agent the `site_id`.
+</details>
 
-The agent gets six tools: `crawl_site`, `direct_search`, `find_action`, `site_map`, `peek_chunk` and `veil_audit`.
+Then ask in plain language:
 
-## Use from the command line
+> Use veilcrawl to crawl https://docs.python.org/3/library/sqlite3.html, at most 12 pages, then find how transactions are opened.
+
+### Or use the command line
 
 ```sh
-node dist/cli.js crawl_site https://example.com --max_pages 50 --veil_level strict --redact_patterns 'acme-\d+' --redact_selectors '.internal'
-node dist/cli.js direct_search <site_id> refund policy
-node dist/cli.js --help
+node dist/cli.js crawl_site https://docs.python.org/3/library/sqlite3.html --max_pages 12 --max_depth 1
+node dist/cli.js direct_search s_0bd11525fdbe open database connection --top_k 1
 ```
 
-`--engine`, `--concurrency`, `--delay_ms`, `--timeout_ms`, `--ignore_robots` and `--engine auto|lightpanda|chromium` work only from the command line. When [Lightpanda](https://lightpanda.io) is installed (`LIGHTPANDA_PATH` or on `PATH`), `auto` uses it for ultra-low RAM crawls and falls back to Chromium otherwise. `veil_audit <site_id> --audit` shows you the redacted values and runs only in an interactive terminal.
+```json
+{
+  "full_matches": 25,
+  "hits": [
+    {
+      "chunk_id": "c_ce",
+      "url": "https://docs.python.org/3/library/sqlite3.html",
+      "title": "sqlite3 — DB-API 2.0 interface for SQLite databases — Pyth…",
+      "snippet": "sqlite3 ensures that a transaction is always open, so connect(), Connection.commit(), and …",
+      "score": 8.85
+    }
+  ]
+}
+```
 
-## Browser engine
+<sub>Snippet shortened for this page.</sub>
 
-[Lightpanda](https://lightpanda.io) is used when it is installed, otherwise Chromium. Choose one with `--engine` or `VEILCRAWL_ENGINE` (`auto`, `lightpanda`, `chromium`); set `LIGHTPANDA_PATH` if it is not found.
+> [!TIP]
+> Large crawls can outlast an MCP client's timeout. Run them from the command line and give the agent the `site_id`.
+
+## Tools
+
+The MCP server and the command line share the same six tools.
+
+| Tool | What it does | Main options |
+| :--- | :--- | :--- |
+| `crawl_site` | Crawls and indexes a site. Returns statistics, never content. | `max_pages` 50 · `max_depth` 3 · `veil_level` · `redact_patterns` · `redact_selectors` |
+| `direct_search` | Searches every indexed page. | `top_k` 5 · `max_tokens` 250 |
+| `find_action` | Finds buttons, links, forms and downloads. | `top_k` 5 |
+| `site_map` | Shows a compact tree of routes. | `max_tokens` 200 |
+| `peek_chunk` | Reads one search hit, with its neighbours if asked. | `window` 0 or 1 |
+| `veil_audit` | Reports redaction counts and tokens saved. | |
+
+## How it works
+
+```mermaid
+flowchart LR
+    Agent["AI agent or CLI"] -->|crawl_site| Crawler["Crawler<br/>Lightpanda"]
+    Crawler --> Extract["Strip boilerplate"]
+    Extract --> Redact["Redact, then split<br/>into small chunks"]
+    Redact --> Index[("Local SQLite index")]
+    Agent -->|"search · find · map · peek"| Budget["Token budget"]
+    Index --> Budget
+    Budget -->|snippets only| Agent
+```
+
+Text is redacted **before** it is indexed, so a hidden value cannot be found by searching for it.
+
+The crawler stays on the starting host, obeys `robots.txt`, waits between page loads, identifies itself as VeilCrawl, and does not bypass logins or CAPTCHAs.
 
 ## Privacy
 
-Indexes live in `~/.veilcrawl` (change with `VEILCRAWL_HOME`), readable only by you. They hold redacted text, plus the original redacted values for the local audit, so treat the files as sensitive. Delete `<site_id>.db` to forget a site.
+| Mode | Behaviour |
+| :--- | :--- |
+| `standard` | Redacts emails, phone numbers, US Social Security numbers, card numbers, and API keys and tokens |
+| `strict` | Also redacts IP addresses, UUIDs and long numbers, caps snippets at 120 characters, and leaves titles out of the site map |
 
-Redaction is pattern-based: it does not catch names, street addresses or deliberately disguised values, and it sometimes hides harmless numbers.
-
-The agent chooses `veil_level` when it crawls, and an agent with shell access can read the index files directly.
-
-## Test
+Add your own rules when you crawl:
 
 ```sh
-npm test
+node dist/cli.js crawl_site https://example.com --veil_level strict \
+  --redact_patterns 'acme-\d+' --redact_selectors '.internal'
 ```
+
+To see what was hidden, run `node dist/cli.js veil_audit <site_id> --audit`. It works only in an interactive terminal.
+
+> [!WARNING]
+> **Know the limits before using this on sensitive sites.**
+> - Redaction is pattern-based. It misses names, street addresses and disguised values, and sometimes hides harmless numbers.
+> - The agent chooses `veil_level`, so it can crawl a `strict` site again as `standard`.
+> - Index files keep the original redacted values for the audit. Only your user account can read them, but that includes any agent with shell access.
+
+Indexes are stored in `~/.veilcrawl`. Delete `<site_id>.db` to forget a site.
+
+## Configuration
+
+| Variable | Effect | Default |
+| :--- | :--- | :--- |
+| `VEILCRAWL_HOME` | Where indexes are stored | `~/.veilcrawl` |
+| `VEILCRAWL_ENGINE` | `auto`, `lightpanda` or `chromium` | `auto` |
+| `LIGHTPANDA_PATH` | Path to the Lightpanda binary | Found automatically |
+
+`auto` uses Lightpanda when it is installed and Chromium otherwise. Lightpanda is looked for in `LIGHTPANDA_PATH`, `PATH`, `~/.local/bin`, `/usr/local/bin` and `/opt/homebrew/bin`.
+
+These `crawl_site` options work only from the command line, so an agent cannot change them over MCP:
+
+| Option | Effect | Default |
+| :--- | :--- | :--- |
+| `--engine` | Overrides `VEILCRAWL_ENGINE` | |
+| `--concurrency` | Pages loaded at once | 4 |
+| `--delay_ms` | Minimum gap between page loads | 200 |
+| `--timeout_ms` | Page load timeout | 15000 |
+| `--ignore_robots` | Skips `robots.txt`, for sites you are authorized to crawl | Off |
+
+## Measured results
+
+| Target | Goal | Measured |
+| :--- | :--- | :--- |
+| Search latency, P95, 500 pages | under 100 ms | 27–41 ms |
+| Tokens compared with raw HTML | at least 95% fewer | 99.6% fewer on a 12-page crawl |
+| Planted secrets reaching the agent | 0 | 0 of 23 |
+
+<sub>Measured on one macOS machine. Latency rises under heavy CPU load. The secrets test runs as part of <code>npm test</code>.</sub>
+
+## Development
+
+```sh
+npm test           # unit, latency and real-browser tests
+npm run typecheck
+npm run build
+```
+
+## Roadmap
+
+- [x] **Phase 1:** crawler, local search, redaction, MCP server and CLI
+- [ ] **Phase 2:** semantic search, API response indexing, better single-page app support
+- [ ] **Phase 3:** running actions through handles, incremental crawls, local dashboard
+
+See [PRD.md](PRD.md) for the full plan.
 
 ## License
 

@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { chmodSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, utimesSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { VeilError } from './errors.ts';
@@ -12,20 +12,23 @@ export interface PageRecord {
   actions: { role: string; label: string; actionType: string; context: string }[];
 }
 
-/** Everything here is already redacted, except `originals`, which only the local audit reads. */
-export interface SiteRecord {
-  id: string;
+/** What a crawl hides. */
+export interface Veil {
   veilLevel: VeilLevel;
-  rawBytes: number;
-  counts: Record<string, number>;
-  originals: Map<string, string>;
-  pages: PageRecord[];
+  patterns: string[];
+  selectors: string[];
 }
 
-export interface SiteMeta {
-  veilLevel: VeilLevel;
+export interface SiteMeta extends Veil {
+  host: string;
   rawBytes: number;
   counts: Record<string, number>;
+}
+
+/** Page content in here is already redacted. */
+export interface SiteRecord extends SiteMeta {
+  id: string;
+  pages: PageRecord[];
 }
 
 const SCHEMA = `
@@ -36,7 +39,6 @@ const SCHEMA = `
   CREATE VIRTUAL TABLE chunks_fts USING fts5 (title, heading, text, tokenize = 'porter unicode61');
   CREATE TABLE actions (id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL, action_type TEXT NOT NULL);
   CREATE VIRTUAL TABLE actions_fts USING fts5 (label, context, title, tokenize = 'porter unicode61');
-  CREATE TABLE originals (placeholder TEXT PRIMARY KEY, value TEXT NOT NULL);
 `;
 
 /** The index splits words at spaces, which these scripts do not use, so each of their characters becomes a word. */
@@ -59,9 +61,39 @@ export function deleteStale(): void {
   }
 }
 
+const unknownSite = () => new VeilError('Unknown or expired site_id. Run crawl_site first.');
+
 function pathFor(siteId: string): string {
-  if (!/^s_[0-9a-f]{12}$/.test(siteId)) throw new VeilError('Unknown or expired site_id. Run crawl_site first.');
+  if (!/^s_[0-9a-f]{12}$/.test(siteId)) throw unknownSite();
   return join(homeDir(), `${siteId}.db`);
+}
+
+const veilPath = (host: string) => join(homeDir(), 'veils', `${encodeURIComponent(host)}.json`);
+
+/** What earlier crawls of a site hid. Crawls only add to it, so an agent cannot crawl again to see more; a person can delete the file. */
+export function keptVeil(host: string): Veil {
+  return existsSync(veilPath(host)) ? JSON.parse(readFileSync(veilPath(host), 'utf8')) : { veilLevel: 'standard', patterns: [], selectors: [] };
+}
+
+export function strongest(a: Veil, b: Veil): Veil {
+  return {
+    veilLevel: a.veilLevel === 'strict' ? 'strict' : b.veilLevel,
+    patterns: [...new Set([...a.patterns, ...b.patterns])],
+    selectors: [...new Set([...a.selectors, ...b.selectors])],
+  };
+}
+
+const hidesLess = (a: Veil, b: Veil) => JSON.stringify(strongest(a, b)) !== JSON.stringify(strongest(a, a));
+
+// shortcut: two crawls of one site that finish in the same moment can lose one's additions, lock the file if that happens.
+function keepVeil(host: string, veil: Veil): void {
+  const kept = keptVeil(host);
+  if (!hidesLess(kept, veil)) return;
+  const path = veilPath(host);
+  mkdirSync(join(path, '..'), { recursive: true, mode: 0o700 });
+  const temp = `${path}.${process.pid}.tmp`;
+  writeFileSync(temp, JSON.stringify(strongest(kept, veil)), { mode: 0o600 });
+  renameSync(temp, path);
 }
 
 /** Builds the index beside the live one and swaps it in, so a failed crawl never destroys an index. */
@@ -81,20 +113,19 @@ export function writeSite(site: SiteRecord): void {
       chunkFts: db.prepare('INSERT INTO chunks_fts (rowid, title, heading, text) VALUES (?, ?, ?, ?)'),
       action: db.prepare('INSERT INTO actions (page_id, role, label, action_type) VALUES (?, ?, ?, ?)'),
       actionFts: db.prepare('INSERT INTO actions_fts (rowid, label, context, title) VALUES (?, ?, ?, ?)'),
-      original: db.prepare('INSERT INTO originals VALUES (?, ?)'),
     };
     db.transaction(() => {
-      const meta: SiteMeta = { veilLevel: site.veilLevel, rawBytes: site.rawBytes, counts: site.counts };
+      const { id, pages, ...meta } = site;
       db.prepare('INSERT INTO meta (json) VALUES (?)').run(JSON.stringify(meta));
-      for (const page of site.pages) {
+      for (const page of pages) {
         const pageId = insert.page.run(page.url, page.title).lastInsertRowid;
         for (const c of page.chunks) insert.chunkFts.run(insert.chunk.run(pageId, c.heading, c.text).lastInsertRowid, forIndex(page.title), forIndex(c.heading), forIndex(c.text));
         for (const a of page.actions)
           insert.actionFts.run(insert.action.run(pageId, a.role, a.label, a.actionType).lastInsertRowid, forIndex(a.label), forIndex(a.context), forIndex(page.title));
       }
-      for (const [placeholder, value] of site.originals) insert.original.run(placeholder, value);
     })();
     db.close();
+    keepVeil(site.host, site);
     renameSync(temp, path);
   } finally {
     db.close();
@@ -105,14 +136,20 @@ export function writeSite(site: SiteRecord): void {
 export function openSite<T>(siteId: string, use: (db: Database.Database, meta: SiteMeta) => T): T {
   const path = pathFor(siteId);
   deleteStale();
-  if (!existsSync(path)) throw new VeilError('Unknown or expired site_id. Run crawl_site first.');
-  const now = new Date();
-  utimesSync(path, now, now);
+  if (!existsSync(path)) throw unknownSite();
   // Read-only: another process may swap the file at any moment, and writing to a swapped file corrupts it.
   const db = new Database(path, { fileMustExist: true, readonly: true });
   try {
     const row = db.prepare('SELECT json FROM meta').get() as { json: string };
-    return use(db, JSON.parse(row.json));
+    const meta = JSON.parse(row.json) as SiteMeta;
+    // No host: made by a version that also stored the redacted values.
+    if (!meta.host || hidesLess(meta, keptVeil(meta.host))) {
+      rmSync(path, { force: true });
+      throw unknownSite();
+    }
+    const now = new Date();
+    utimesSync(path, now, now);
+    return use(db, meta);
   } finally {
     db.close();
   }

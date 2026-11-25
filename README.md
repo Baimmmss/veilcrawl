@@ -243,15 +243,18 @@ node dist/cli.js crawl_site https://example.com --veil_level strict \
   --redact_patterns 'acme-\d+' --redact_selectors '.internal'
 ```
 
-To see what was hidden, run `node dist/cli.js veil_audit <site_id> --audit`. It works only in an interactive terminal.
+These settings stay on for the whole site: later crawls can add to them, but not remove them. To start over, delete the site's file in `~/.veilcrawl/veils`.
+
+To see what was hidden, add `--audit` to `crawl_site`. It prints the hidden values and works only in an interactive terminal.
 
 > [!WARNING]
 > **Know the limits before using this on sensitive sites.**
 > - Redaction is pattern-based. It misses names, street addresses and disguised values, and sometimes hides harmless numbers.
-> - The agent chooses `veil_level` and can crawl a `strict` site again as `standard`, unless you set `VEILCRAWL_VEIL=strict`.
-> - Index files keep the original redacted values for the audit. Only your user account can read them, but that includes any agent with shell access.
+> - The agent chooses `veil_level` the first time it crawls a site, unless you set `VEILCRAWL_VEIL=strict`.
+> - Settings belong to one host and port. The same pages under another name, such as a subdomain or an IP address, are a separate site.
+> - Hidden values are not saved, but an agent with shell access can read the redacted index and your `redact_patterns`, delete the saved settings, or open the site without VeilCrawl.
 
-Indexes are stored in `~/.veilcrawl`. A site that nobody crawls or reads for 7 days is deleted the next time VeilCrawl is used. Delete `<site_id>.db` to forget a site sooner.
+Indexes are stored in `~/.veilcrawl`. A site that nobody crawls or reads for 7 days is deleted the next time VeilCrawl is used. Delete `<site_id>.db` to forget a site sooner. The settings in `veils` are kept until you delete them. Indexes made by an older version are deleted when used, so crawl those sites again.
 
 ## Configuration
 
@@ -295,7 +298,7 @@ What an agent would read for the three English use cases above:
 | **VeilCrawl, crawl and search** | **about 140** | **about 215** | **about 85** |
 
 - **Large savings on long pages,** or when the agent does not know which page has the answer.
-- **Little or no saving on one short page.** The tool descriptions add about 740 tokens to a conversation, so if the agent already knows the right SQLite or Node.js page, reading it directly is cheaper.
+- **Little or no saving on one short page.** The tool descriptions add about 750 tokens to a conversation, so if the agent already knows the right SQLite or Node.js page, reading it directly is cheaper.
 
 <sub>Counted with gpt-tokenizer on 25 November 2026; other models count differently. Clean text is the browser's visible text. Each search is capped at 250 tokens by default.</sub>
 

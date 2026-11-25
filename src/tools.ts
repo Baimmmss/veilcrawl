@@ -36,7 +36,7 @@ function tool<S extends z.ZodObject>(
 export const tools = [
   tool(
     'crawl_site',
-    'Crawl and privately index a whole website on this machine. Returns a site_id and statistics, never page content.',
+    'Crawl and privately index a whole website on this machine. Returns a site_id and statistics, never page content. Redaction set by earlier crawls of the site stays on.',
     ['url'],
     z.object({
       url: z.string(),

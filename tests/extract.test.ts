@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -7,11 +7,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { promisify } from 'node:util';
 
 process.env.VEILCRAWL_HOME = mkdtempSync(join(tmpdir(), 'veil-extract-'));
 const { crawlSite } = await import('../src/crawler.ts');
 const { findLightpanda, launchBrowser } = await import('../src/browser.ts');
-const { openSite, writeSite } = await import('../src/store.ts');
+const { openSite } = await import('../src/store.ts');
 
 const pages: Record<string, string> = {
   '/': `<main><h1>Title <span style="display:none">HIDDENHEAD</span><span hidden>HIDDENATTR</span></h1>
@@ -27,6 +28,7 @@ const pages: Record<string, string> = {
   '/links': `<main>${Array.from({ length: 700 }, (_, i) => `<a href="/l${i}">Link number ${i}</a> `).join('')}</main>`,
   '/few': `<p>few</p>${Array.from({ length: 10 }, (_, i) => `<a href="/private/${i}">x</a>`).join('')}${Array.from({ length: 6 }, (_, i) => `<a href="/ok${i}">x</a>`).join('')}`,
   ...Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`/ok${i}`, `<p>Allowed page ${i}.</p>`])),
+  '/audit': '<main><p>Write to ann@example.com.</p><p>x\u009b2Jy</p></main>',
   '/robots.txt': 'User-agent: *\nDisallow: /private',
 };
 let server: Server;
@@ -118,10 +120,10 @@ test('a mistyped VEILCRAWL_ENGINE is an error', async () => {
 });
 
 test('the audit view shows a person the originals without terminal control codes', async () => {
-  writeSite({ id: 's_ababababab12', veilLevel: 'standard', rawBytes: 1, counts: {}, pages: [], originals: new Map([['[EMAIL_1]', 'ann@example.com'], ['[CUSTOM_1]', 'x\x1b[2Jy']]) });
   const asTerminal = 'data:text/javascript,process.stdin.isTTY=process.stdout.isTTY=true';
-  const out = execFileSync(process.execPath, ['--import', asTerminal, 'src/cli.ts', 'veil_audit', 's_ababababab12', '--audit']).toString();
-  assert.equal(out, '[EMAIL_1]\tann@example.com\n[CUSTOM_1]\tx [2Jy\n');
+  const audit = (...args: string[]) => promisify(execFile)(process.execPath, ['--import', asTerminal, 'src/cli.ts', ...args]);
+  const { stdout } = await audit('crawl_site', `${url}audit`, '--max_pages', '1', '--audit', '--redact_patterns', 'x.{1,9}y');
+  assert.ok(stdout.startsWith('[EMAIL_1]\tann@example.com\n[CUSTOM_1]\tx 2Jy\n{'), JSON.stringify(stdout));
 });
 
 test('VEILCRAWL_VEIL=strict overrides a weaker request, and a typo is an error', async () => {

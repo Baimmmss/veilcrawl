@@ -16,7 +16,7 @@ const call = async (name: string, args: object): Promise<any> => {
   return tool.run(tool.schema.parse(args));
 };
 const site = (id: string, veilLevel: 'standard' | 'strict', pages: number, perPage: number) => ({
-  id, veilLevel, rawBytes: pages * 50_000, counts: { EMAIL: 3 }, originals: new Map([['[EMAIL_1]', 'john@example.com']]),
+  id, veilLevel, rawBytes: pages * 50_000, counts: { EMAIL: 3 }, host: `${id}.com`, patterns: [], selectors: [],
   pages: Array.from({ length: pages }, (_, p) => ({
     url: `https://x.com/docs/section-${p % 20}/page-${p}`, title: `Guide ${p}`,
     chunks: Array.from({ length: perPage }, (_, c) => ({ heading: `Topic ${c}`, text: `Passage ${c} of guide ${p} explains widget configuration and limits. ${'Extra filler words follow here. '.repeat(7)}` })),
@@ -109,7 +109,7 @@ test('veil_audit reports redaction counts and tokens saved, never values', async
 });
 test('index files are private to the user and replaced atomically', () => {
   const dir = process.env.VEILCRAWL_HOME!;
-  for (const f of readdirSync(dir)) { assert.match(f, /\.db$/); assert.equal(statSync(join(dir, f)).mode & 0o077, 0); }
+  for (const f of readdirSync(dir).filter((f) => f !== 'veils')) { assert.match(f, /\.db$/); assert.equal(statSync(join(dir, f)).mode & 0o077, 0); }
 });
 test('P95 direct_search latency is under 100ms on a 500-page site', async () => {
   const times: number[] = [];

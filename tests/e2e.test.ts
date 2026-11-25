@@ -168,8 +168,10 @@ test('CLI rejects unknown tools, flags and bad values with a non-zero exit', asy
 });
 
 test('the local audit view refuses to run without a human terminal', async () => {
-  const r = await cli('veil_audit', crawl.site_id, '--audit');
+  site.hits.length = 0;
+  const r = await cli('crawl_site', site.url, '--audit');
   assert.notEqual(r.code, 0);
   assert.match(r.err, /terminal/);
+  assert.equal(site.hits.length, 0);
   for (const s of SECRETS) assert.ok(!(r.out + r.err).includes(s));
 });

@@ -11,6 +11,10 @@ test('normalizes tracking params, param order, fragments and credentials', () =>
 test('keeps hash routes', () => {
   assert.equal(normalizeUrl('https://x.com/#/settings'), 'https://x.com/#/settings');
 });
+test('a final dot on the host is the same site', () => {
+  assert.equal(urlKey('https://x.com./a'), urlKey('https://x.com/a'));
+  assert.ok(inScope('https://x.com.:8080/', 'https://www.x.com:8080/') && !inScope('https://x.com.evil.io/', 'https://x.com/'));
+});
 test('rejects non-web URLs', () => {
   for (const u of ['file:///etc/passwd', 'javascript:alert(1)', 'mailto:a@b.c', 'not a url']) assert.equal(normalizeUrl(u), null);
 });

@@ -3,7 +3,6 @@ import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import { VeilError } from './errors.ts';
 import { runMcpServer } from './mcp.ts';
-import { openSite } from './store.ts';
 import { tools } from './tools.ts';
 
 const localOptions = z.object({
@@ -22,16 +21,13 @@ function usage(): string {
   return [
     'Usage:', ...lines, '  veilcrawl mcp', '',
     `crawl_site also takes ${Object.keys(localOptions.shape).map((k) => `--${k}`).join(' ')}`,
-    'veil_audit --audit shows the redacted values themselves (terminal only)',
+    'crawl_site --audit shows the redacted values themselves (terminal only, never saved)',
   ].join('\n');
 }
 
-/** Prints redacted originals. The terminal check keeps piped agent shells out; it is not an access control. */
-function printAudit(siteId: string): void {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new VeilError('--audit shows private values and only runs in an interactive terminal.');
-  const rows = openSite(siteId, (db) => db.prepare('SELECT placeholder, value FROM originals ORDER BY rowid').all()) as { placeholder: string; value: string }[];
+function printAudit(originals: Map<string, string>): void {
   // Values come from web pages: control characters could drive the terminal.
-  for (const r of rows) console.log(`${r.placeholder}\t${r.value.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}`);
+  for (const [placeholder, value] of originals) console.log(`${placeholder}\t${value.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}`);
 }
 
 async function main(argv: string[]): Promise<void> {
@@ -45,7 +41,7 @@ async function main(argv: string[]): Promise<void> {
   const flags: Record<string, { type: 'string' | 'boolean'; multiple?: boolean }> = {};
   for (const key of Object.keys(tool.schema.shape)) if (!tool.positional.includes(key)) flags[key] = { type: 'string', multiple: key.startsWith('redact_') };
   if (isCrawl) for (const key of Object.keys(localOptions.shape)) flags[key] = { type: key === 'ignore_robots' ? 'boolean' : 'string' };
-  if (name === 'veil_audit') flags.audit = { type: 'boolean' };
+  if (isCrawl) flags.audit = { type: 'boolean' };
 
   const { values, positionals } = parseArgs({ args: rest, options: flags, allowPositionals: true });
   const input: Record<string, unknown> = { ...values };
@@ -56,8 +52,10 @@ async function main(argv: string[]): Promise<void> {
     if (value) input[key] = value;
   });
   const args = tool.schema.parse(input) as any;
-  if (values.audit) return printAudit(args.site_id);
-  const result = await tool.run(args, isCrawl ? localOptions.parse(input) : undefined);
+  // Keeps piped agent shells out; it is not an access control.
+  if (values.audit && !(process.stdin.isTTY && process.stdout.isTTY)) throw new VeilError('--audit shows private values and only runs in an interactive terminal.');
+  const local = { ...localOptions.parse(input), audit: values.audit ? printAudit : undefined };
+  const result = await tool.run(args, isCrawl ? local : undefined);
   console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
 }
 

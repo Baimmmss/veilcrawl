@@ -15,16 +15,17 @@ export function normalizeUrl(raw: string): string | null {
   return url.href;
 }
 
-function site(url: URL): string {
-  return url.host.replace(/^www\./, '');
+/** The site a URL belongs to: its host and port. "x.com." is the same host as "x.com". */
+export function siteOf(url: string): string {
+  return new URL(url).host.replace(/^www\.|\.(?=:|$)/g, '');
 }
 
 /** Identity used for deduplication. */
 export function urlKey(url: string): string {
   const u = new URL(url);
-  return site(u) + u.pathname.replace(/\/+$/, '') + u.search + u.hash;
+  return siteOf(url) + u.pathname.replace(/\/+$/, '') + u.search + u.hash;
 }
 
 export function inScope(url: string, start: string): boolean {
-  return site(new URL(url)) === site(new URL(start));
+  return siteOf(url) === siteOf(start);
 }

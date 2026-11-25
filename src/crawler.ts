@@ -7,8 +7,8 @@ import { VeilError } from './errors.ts';
 import { extractPage, type RawPage } from './extract.ts';
 import { Redactor, type VeilLevel } from './redactor.ts';
 import { fetchRobots, type Robots } from './robots.ts';
-import { writeSite, type PageRecord } from './store.ts';
-import { inScope, normalizeUrl, urlKey } from './url.ts';
+import { keptVeil, strongest, writeSite, type PageRecord } from './store.ts';
+import { inScope, normalizeUrl, siteOf, urlKey } from './url.ts';
 
 export interface CrawlArgs {
   url: string;
@@ -26,6 +26,8 @@ export interface LocalCrawlOptions {
   timeout_ms?: number;
   ignore_robots?: boolean;
   engine?: BrowserEngine;
+  /** Receives placeholder -> original value. They are never written to disk. */
+  audit?(originals: Map<string, string>): void;
 }
 
 const USER_AGENT = 'Mozilla/5.0 (compatible; VeilCrawl/0.1)';
@@ -35,14 +37,16 @@ const NOT_A_PAGE = /\.(?:pdf|zip|gz|tar|dmg|exe|pkg|csv|xlsx?|docx?|pptx?|png|jp
 type Skip = 'robots' | 'http_error' | 'not_html' | 'off_site' | 'failed' | 'duplicate';
 
 export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) {
-  const { concurrency = 4, delay_ms = 200, timeout_ms = 15_000, ignore_robots = false, engine } = local;
+  const { concurrency = 4, delay_ms = 200, timeout_ms = 15_000, ignore_robots = false, engine, audit } = local;
   const start = normalizeUrl(args.url);
   if (!start) throw new VeilError('url must be a full http:// or https:// address.');
   // Set by the person running VeilCrawl, so an agent cannot crawl a site again with a weaker veil.
   const floor = process.env.VEILCRAWL_VEIL ?? 'standard';
   if (floor !== 'standard' && floor !== 'strict') throw new VeilError('VEILCRAWL_VEIL must be "standard" or "strict".');
-  const veilLevel = floor === 'strict' ? 'strict' : args.veil_level;
-  const redactor = new Redactor(veilLevel, args.redact_patterns);
+  const host = siteOf(start);
+  const asked = { veilLevel: floor === 'strict' ? floor : args.veil_level, patterns: args.redact_patterns, selectors: args.redact_selectors };
+  const veil = strongest(keptVeil(host), asked);
+  const redactor = new Redactor(veil.veilLevel, veil.patterns);
 
   const session = await launchBrowser(engine, timeout_ms);
   const { browser } = session;
@@ -52,7 +56,7 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
         ? await browser.newContext()
         : await browser.newContext({ userAgent: USER_AGENT, serviceWorkers: 'block', acceptDownloads: false });
     if (session.engine === 'chromium') await blockAssets(context);
-    await checkSelectors(context, args.redact_selectors);
+    await checkSelectors(context, veil.selectors);
 
     const robotsByOrigin = new Map<string, Promise<Robots>>();
     const robotsFor = (url: string): Promise<Robots> => {
@@ -89,7 +93,7 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
         if (!landed || !inScope(landed, start)) return 'off_site';
         if (!(await robotsFor(landed)).allowed(landed)) return 'robots';
         // evaluate has no timeout of its own, and a script that never ends would block it forever.
-        const data = await Promise.race([page.evaluate(extractPage, args.redact_selectors), sleep(timeout_ms, null, { ref: false })]);
+        const data = await Promise.race([page.evaluate(extractPage, veil.selectors), sleep(timeout_ms, null, { ref: false })]);
         if (!data) return 'failed';
         // A script may have navigated while we were reading.
         return normalizeUrl(page.url()) === landed ? { url: landed, data } : 'failed';
@@ -156,7 +160,8 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
     dropRepeatedBlocks(pages);
     const records: PageRecord[] = pages.map(({ blocks, ...page }) => ({ ...page, chunks: chunkBlocks(blocks, redactor) }));
     const id = `s_${createHash('sha256').update(urlKey(start)).digest('hex').slice(0, 12)}`;
-    writeSite({ id, veilLevel, rawBytes, counts: redactor.counts, originals: redactor.originals, pages: records });
+    writeSite({ id, host, ...veil, rawBytes, counts: redactor.counts, pages: records });
+    audit?.(redactor.originals);
     return {
       site_id: id,
       pages_indexed: records.length,

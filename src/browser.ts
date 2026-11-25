@@ -1,3 +1,4 @@
+import { once } from 'node:events';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
 import { createServer } from 'node:net';
@@ -17,22 +18,13 @@ export interface BrowserSession {
   close(): Promise<void>;
 }
 
+export const TRACKERS = [
+  'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'facebook.net', 'hotjar.com', 'segment.io', 'segment.com', 'mixpanel.com',
+  'amplitude.com', 'fullstory.com', 'clarity.ms', 'googlesyndication.com', 'intercom.io', 'newrelic.com', 'nr-data.net',
+];
+
 const LIGHTPANDA_BLOCK_URLS = [
-  '*://*.google-analytics.com/*',
-  '*://*.googletagmanager.com/*',
-  '*://*.doubleclick.net/*',
-  '*://*.facebook.net/*',
-  '*://*.hotjar.com/*',
-  '*://*.segment.io/*',
-  '*://*.segment.com/*',
-  '*://*.mixpanel.com/*',
-  '*://*.amplitude.com/*',
-  '*://*.fullstory.com/*',
-  '*://*.clarity.ms/*',
-  '*://*.googlesyndication.com/*',
-  '*://*.intercom.io/*',
-  '*://*.newrelic.com/*',
-  '*://*.nr-data.net/*',
+  ...TRACKERS.flatMap((t) => [`*://${t}/*`, `*://*.${t}/*`]),
   '*://*/*.png',
   '*://*/*.png?*',
   '*://*/*.jpg',
@@ -116,12 +108,24 @@ async function launchLightpanda(timeoutMs: number): Promise<BrowserSession> {
     '--disable-metrics',
     '--log-level', 'error',
     '--http-timeout', String(timeoutMs),
+    '--http-max-response-size', '20000000',
     '--user-agent-suffix', 'VeilCrawl/0.1',
     ...LIGHTPANDA_BLOCK_URLS.flatMap((pattern) => ['--block-urls', pattern]),
   ];
 
-  const proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+  const proc = spawn(bin, args, { stdio: 'ignore' });
+  // Lightpanda would outlive us. After killing it, the signal is sent again for its normal effect.
+  const onSignal = (signal: NodeJS.Signals) => {
+    proc.kill('SIGKILL');
+    process.kill(process.pid, signal);
+  };
+  const onExit = () => void proc.kill('SIGKILL');
+  const signals = ['SIGTERM', 'SIGINT', 'SIGHUP'] as const;
+  for (const signal of signals) process.once(signal, onSignal);
+  process.once('exit', onExit);
   const killProc = async () => {
+    for (const signal of signals) process.off(signal, onSignal);
+    process.off('exit', onExit);
     if (proc.exitCode !== null) return;
     proc.kill('SIGTERM');
     await Promise.race([
@@ -133,7 +137,9 @@ async function launchLightpanda(timeoutMs: number): Promise<BrowserSession> {
   };
 
   try {
-    await waitForCdp(endpoint, proc);
+    // Without this listener a path that cannot run would crash the whole program.
+    const spawnFailed = once(proc, 'error').then(([error]) => Promise.reject(error));
+    await Promise.race([waitForCdp(endpoint, proc), spawnFailed]);
     const browser = await chromium.connectOverCDP(endpoint);
     return {
       browser,
@@ -146,11 +152,11 @@ async function launchLightpanda(timeoutMs: number): Promise<BrowserSession> {
     };
   } catch (error) {
     await killProc();
-    throw error;
+    throw new VeilError(`Lightpanda did not start (${(error as Error).message}).`);
   }
 }
 
-async function launchChromium(): Promise<BrowserSession> {
+async function launchChromium(reason = ''): Promise<BrowserSession> {
   try {
     const browser = await chromium.launch();
     return {
@@ -162,7 +168,7 @@ async function launchChromium(): Promise<BrowserSession> {
     };
   } catch (error) {
     if (/Executable doesn't exist/.test(String(error))) {
-      throw new VeilError('Chromium is missing. Run: npx playwright install chromium --only-shell');
+      throw new VeilError(`${reason}Chromium is missing. Install Lightpanda (https://lightpanda.io) or run: npx playwright install chromium --only-shell`);
     }
     throw error;
   }
@@ -172,8 +178,8 @@ export async function launchBrowser(
   requested?: BrowserEngine,
   timeoutMs = 15_000,
 ): Promise<BrowserSession> {
-  const envEngine = process.env.VEILCRAWL_ENGINE as BrowserEngine | undefined;
-  const choice: BrowserEngine = requested ?? (envEngine && ['auto', 'lightpanda', 'chromium'].includes(envEngine) ? envEngine : 'auto');
+  const choice = requested ?? process.env.VEILCRAWL_ENGINE ?? 'auto';
+  if (!['auto', 'lightpanda', 'chromium'].includes(choice)) throw new VeilError('VEILCRAWL_ENGINE must be "auto", "lightpanda" or "chromium".');
 
   if (choice === 'chromium') return launchChromium();
   if (choice === 'lightpanda') return launchLightpanda(timeoutMs);
@@ -182,8 +188,8 @@ export async function launchBrowser(
   if (findLightpanda()) {
     try {
       return await launchLightpanda(timeoutMs);
-    } catch {
-      return launchChromium();
+    } catch (error) {
+      return launchChromium(`${(error as Error).message} `);
     }
   }
   return launchChromium();

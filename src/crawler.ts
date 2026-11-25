@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { BrowserContext, Page } from 'playwright';
-import { launchBrowser, type BrowserEngine } from './browser.ts';
+import { launchBrowser, TRACKERS, type BrowserEngine } from './browser.ts';
 import { chunkBlocks, type Block } from './chunker.ts';
 import { VeilError } from './errors.ts';
 import { extractPage, type RawPage } from './extract.ts';
@@ -30,9 +30,7 @@ export interface LocalCrawlOptions {
 
 const USER_AGENT = 'Mozilla/5.0 (compatible; VeilCrawl/0.1)';
 const BLOCKED_TYPES = new Set(['image', 'font', 'media']);
-const TRACKERS = /(?:^|\.)(?:google-analytics\.com|googletagmanager\.com|doubleclick\.net|facebook\.net|hotjar\.com|segment\.(?:io|com)|mixpanel\.com|amplitude\.com|fullstory\.com|clarity\.ms|googlesyndication\.com|intercom\.io|newrelic\.com|nr-data\.net)$/;
 const NOT_A_PAGE = /\.(?:pdf|zip|gz|tar|dmg|exe|pkg|csv|xlsx?|docx?|pptx?|png|jpe?g|gif|webp|svg|ico|mp[34]|webm|mov|woff2?|css|js|json|xml|rss)$/i;
-const MAX_ACTIONS_PER_PAGE = 500;
 
 type Skip = 'robots' | 'http_error' | 'not_html' | 'off_site' | 'failed' | 'duplicate';
 
@@ -40,7 +38,11 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
   const { concurrency = 4, delay_ms = 200, timeout_ms = 15_000, ignore_robots = false, engine } = local;
   const start = normalizeUrl(args.url);
   if (!start) throw new VeilError('url must be a full http:// or https:// address.');
-  const redactor = new Redactor(args.veil_level, args.redact_patterns);
+  // Set by the person running VeilCrawl, so an agent cannot crawl a site again with a weaker veil.
+  const floor = process.env.VEILCRAWL_VEIL ?? 'standard';
+  if (floor !== 'standard' && floor !== 'strict') throw new VeilError('VEILCRAWL_VEIL must be "standard" or "strict".');
+  const veilLevel = floor === 'strict' ? 'strict' : args.veil_level;
+  const redactor = new Redactor(veilLevel, args.redact_patterns);
 
   const session = await launchBrowser(engine, timeout_ms);
   const { browser } = session;
@@ -61,6 +63,7 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
     };
     if (!(await robotsFor(start)).allowed(start)) throw new VeilError('robots.txt disallows this address, or could not be reached.');
 
+    let attempts = 0;
     let nextLoad = 0;
     const waitTurn = async (url: string) => {
       const gap = Math.max(delay_ms, Math.min((await robotsFor(url)).delayMs, 30_000));
@@ -71,6 +74,7 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
 
     const load = async (url: string): Promise<{ url: string; data: RawPage } | Skip> => {
       if (!(await robotsFor(url)).allowed(url)) return 'robots';
+      attempts++;
       let page: Page | undefined;
       try {
         page = await (session.connect ? (await session.connect()).newPage() : context.newPage());
@@ -106,12 +110,10 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
     const skipped: Partial<Record<Skip, number>> = {};
     const skip = (why: Skip) => (skipped[why] = (skipped[why] ?? 0) + 1);
     let rawBytes = 0;
-    let attempts = 0;
 
     // shortcut: one slow page holds up its batch, use a worker pool if crawls get too long.
     while (queue.length && pages.length < args.max_pages && attempts < args.max_pages * 2) {
       const batch = queue.splice(0, Math.min(concurrency, args.max_pages - pages.length));
-      attempts += batch.length;
       const results = await Promise.all(batch.map((item) => load(item.url)));
       results.forEach((result, i) => {
         if (typeof result === 'string') return skip(result);
@@ -125,7 +127,8 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
           }
         }
 
-        const url = canonicalUrl(result.url, data.canonical);
+        // Canonical links are not trusted: sites point every page of a list at its first page.
+        const { url } = result;
         const content = data.blocks.length ? createHash('sha256').update(JSON.stringify(data.blocks)).digest('hex') : url;
         if (indexed.has(urlKey(url)) || contents.has(content)) return skip('duplicate');
         indexed.add(urlKey(url));
@@ -134,7 +137,7 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
 
         rawBytes += data.rawBytes;
         if (data.denied) redactor.counts.SELECTOR = (redactor.counts.SELECTOR ?? 0) + data.denied;
-        const actions = data.actions.filter((a) => !actionKeys.has(a.key) && actionKeys.add(a.key)).slice(0, MAX_ACTIONS_PER_PAGE);
+        const actions = data.actions.filter((a) => !actionKeys.has(a.key) && actionKeys.add(a.key));
         pages.push({
           url: redactor.redactUrl(url),
           title: redactor.redact(data.title).slice(0, 200),
@@ -153,7 +156,7 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
     dropRepeatedBlocks(pages);
     const records: PageRecord[] = pages.map(({ blocks, ...page }) => ({ ...page, chunks: chunkBlocks(blocks, redactor) }));
     const id = `s_${createHash('sha256').update(urlKey(start)).digest('hex').slice(0, 12)}`;
-    writeSite({ id, startUrl: redactor.redactUrl(start), veilLevel: args.veil_level, rawBytes, counts: redactor.counts, originals: redactor.originals, pages: records });
+    writeSite({ id, veilLevel, rawBytes, counts: redactor.counts, originals: redactor.originals, pages: records });
     return {
       site_id: id,
       pages_indexed: records.length,
@@ -171,7 +174,8 @@ async function blockAssets(context: BrowserContext): Promise<void> {
   await context.route('**/*', (route) => {
     const request = route.request();
     const frame = request.isNavigationRequest() && request.resourceType() === 'document' ? parentFrameOf(request) : null;
-    const tracker = URL.canParse(request.url()) && TRACKERS.test(new URL(request.url()).hostname);
+    const host = URL.canParse(request.url()) ? new URL(request.url()).hostname : '';
+    const tracker = TRACKERS.some((t) => host === t || host.endsWith(`.${t}`));
     return BLOCKED_TYPES.has(request.resourceType()) || tracker || frame ? route.abort() : route.continue();
   });
 }
@@ -191,13 +195,6 @@ async function checkSelectors(context: BrowserContext, selectors: string[]): Pro
     if (!valid) throw new VeilError(`Invalid redact selector: ${selector}`);
   }
   await page.close();
-}
-
-/** Sites often point every page's canonical link at the home page by mistake, so that case is ignored. */
-function canonicalUrl(url: string, canonical: string | null): string {
-  const target = canonical && normalizeUrl(canonical);
-  if (!target || !inScope(target, url)) return url;
-  return new URL(target).pathname === '/' && new URL(url).pathname !== '/' ? url : target;
 }
 
 /**

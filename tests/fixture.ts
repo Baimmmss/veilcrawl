@@ -40,7 +40,7 @@ export async function startFixture() {
       <script>document.cookie="sid=cookie-value-999";setTimeout(()=>{late.textContent="Rendered by JavaScript zebra.";},150);
       customElements.define('my-card',class extends HTMLElement{constructor(){super();this.attachShadow({mode:'open'}).innerHTML='<p>Shadow walrus shadow@example.com</p><button>Shadow launch</button>'}});</script>`),
     '/about': () => layout('About', '<main><h1>About</h1><p>Our refund window is thirty days. We ship worldwide.</p></main>'),
-    '/alias': () => layout('About alias', '<main><p>Alias copy of the about page.</p></main>', '<link rel=canonical href="/about">'),
+    '/alias': () => layout('About alias', '<main><h1>About</h1><p>Our refund window is thirty days. We ship worldwide.</p></main>', '<link rel=canonical href="/about">'),
     '/u/urlpath@example.com': () => layout('User', '<main><p>User profile giraffe content.</p></main>'),
     '/q': () => layout('Q', '<main><p>Query page pelican content.</p></main>'),
     '/offsite': () => layout('Offsite', '<main><p>Offsite content ostrich.</p></main>'),

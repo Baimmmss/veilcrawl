@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { VeilError } from './errors.ts';
+import { deleteStale } from './store.ts';
 import { tools } from './tools.ts';
 
 export function createMcpServer(): McpServer {
@@ -22,5 +23,6 @@ export function createMcpServer(): McpServer {
 }
 
 export async function runMcpServer(): Promise<void> {
+  deleteStale();
   await createMcpServer().connect(new StdioServerTransport());
 }

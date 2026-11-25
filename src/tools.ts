@@ -1,10 +1,10 @@
-import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import { estimateTokens, fitBudget, snippet } from './budget.ts';
 import { crawlSite, type LocalCrawlOptions } from './crawler.ts';
 import { VeilError } from './errors.ts';
-import { openSite, type SiteMeta } from './store.ts';
+import { forIndex, openSite } from './store.ts';
 
+const SEARCH_TOKENS = 250;
 const FIND_ACTION_TOKENS = 250;
 const PEEK_TOKENS = 300;
 
@@ -15,22 +15,13 @@ const maxTokens = (fallback: number) => z.coerce.number().int().min(50).max(2000
 const STOPWORDS = new Set('a an and are as at be by can do does for from how i in is it my of on or that the this to was what when where which who why will with you your'.split(' '));
 
 function termsOf(query: string): string[] {
-  const all = query.match(/[\p{L}\p{N}_]+/gu) ?? [];
+  const all = query.match(/[\p{L}\p{M}\p{N}_]+/gu) ?? [];
   const useful = all.filter((t) => !STOPWORDS.has(t.toLowerCase()));
   return useful.length ? useful : all;
 }
 
-const ftsQuery = (terms: string[], operator: 'AND' | 'OR') => terms.map((t) => `"${t}"`).join(` ${operator} `);
+const ftsQuery = (terms: string[], operator: 'AND' | 'OR') => terms.map((t) => `"${forIndex(t)}"`).join(` ${operator} `);
 const chunkId = (id: number) => `c_${id.toString(36)}`;
-
-/** Every read goes through here so veil_audit can report what agents were actually given. */
-function serve<T>(id: string, read: (db: Database.Database, meta: SiteMeta) => T): T {
-  return openSite(id, (db, meta) => {
-    const result = read(db, meta);
-    db.prepare('UPDATE meta SET served = served + ?').run(estimateTokens(typeof result === 'string' ? result : JSON.stringify(result)));
-    return result;
-  });
-}
 
 function tool<S extends z.ZodObject>(
   name: string,
@@ -62,9 +53,9 @@ export const tools = [
     'direct_search',
     'Search every indexed page of a site in one call. Returns short redacted snippets.',
     ['site_id', 'query'],
-    z.object({ site_id: siteId, query: z.string(), top_k: topK, max_tokens: maxTokens(250) }),
+    z.object({ site_id: siteId, query: z.string(), top_k: topK, max_tokens: maxTokens(SEARCH_TOKENS) }),
     (args) =>
-      serve(args.site_id, (db, meta) => {
+      openSite(args.site_id, (db, meta) => {
         const terms = termsOf(args.query);
         if (!terms.length) return { full_matches: 0, hits: [] };
         const rows = db
@@ -94,7 +85,7 @@ export const tools = [
     ['site_id', 'intent'],
     z.object({ site_id: siteId, intent: z.string(), top_k: topK }),
     (args) =>
-      serve(args.site_id, (db, meta) => {
+      openSite(args.site_id, (db, meta) => {
         const terms = termsOf(args.intent);
         const rows = terms.length
           ? (db
@@ -123,7 +114,7 @@ export const tools = [
     ['site_id'],
     z.object({ site_id: siteId, max_tokens: maxTokens(200) }),
     (args) =>
-      serve(args.site_id, (db, meta) => {
+      openSite(args.site_id, (db, meta) => {
         const pages = db
           .prepare('SELECT p.id, p.url, p.title, count(c.id) AS chunks FROM pages p LEFT JOIN chunks c ON c.page_id = p.id GROUP BY p.id ORDER BY p.id')
           .all() as MapPage[];
@@ -157,7 +148,7 @@ export const tools = [
     ['site_id', 'chunk_id'],
     z.object({ site_id: siteId, chunk_id: z.string(), window: z.coerce.number().int().min(0).max(1).default(0) }),
     (args) =>
-      serve(args.site_id, (db, meta) => {
+      openSite(args.site_id, (db, meta) => {
         const id = /^c_[0-9a-z]{1,10}$/.test(args.chunk_id) ? parseInt(args.chunk_id.slice(2), 36) : 0;
         const target = db.prepare('SELECT page_id, heading FROM chunks WHERE id = ?').get(id) as { page_id: number; heading: string } | undefined;
         if (!target) throw new VeilError('Unknown chunk_id for this site.');
@@ -173,20 +164,18 @@ export const tools = [
 
   tool(
     'veil_audit',
-    'Redaction counts by category and tokens saved compared with raw HTML. Never includes redacted values.',
+    'Redaction counts by category and tokens a default search saves compared with raw HTML. Never includes redacted values.',
     ['site_id'],
     z.object({ site_id: siteId }),
     (args) =>
-      openSite(args.site_id, (db, meta) => {
-        const { served } = db.prepare('SELECT served FROM meta').get() as { served: number };
+      openSite(args.site_id, (_, meta) => {
         const raw = Math.ceil(meta.rawBytes / 3);
         return {
           veil_level: meta.veilLevel,
           redactions: meta.counts,
           raw_html_tokens: raw,
-          tokens_served: served,
-          tokens_saved: raw - served,
-          reduction_pct: raw ? Math.round((1 - served / raw) * 1000) / 10 : 0,
+          tokens_saved_per_search: raw - SEARCH_TOKENS,
+          reduction_pct: raw ? Math.round((1 - SEARCH_TOKENS / raw) * 1000) / 10 : 0,
         };
       }),
   ),

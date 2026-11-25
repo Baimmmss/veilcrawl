@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { chmodSync, existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, utimesSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { VeilError } from './errors.ts';
@@ -15,7 +15,6 @@ export interface PageRecord {
 /** Everything here is already redacted, except `originals`, which only the local audit reads. */
 export interface SiteRecord {
   id: string;
-  startUrl: string;
   veilLevel: VeilLevel;
   rawBytes: number;
   counts: Record<string, number>;
@@ -24,14 +23,13 @@ export interface SiteRecord {
 }
 
 export interface SiteMeta {
-  startUrl: string;
   veilLevel: VeilLevel;
   rawBytes: number;
   counts: Record<string, number>;
 }
 
 const SCHEMA = `
-  CREATE TABLE meta (json TEXT NOT NULL, served INTEGER NOT NULL DEFAULT 0);
+  CREATE TABLE meta (json TEXT NOT NULL);
   CREATE TABLE pages (id INTEGER PRIMARY KEY, url TEXT NOT NULL, title TEXT NOT NULL);
   CREATE TABLE chunks (id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL, heading TEXT NOT NULL, text TEXT NOT NULL);
   CREATE INDEX chunks_page ON chunks (page_id);
@@ -41,14 +39,35 @@ const SCHEMA = `
   CREATE TABLE originals (placeholder TEXT PRIMARY KEY, value TEXT NOT NULL);
 `;
 
+/** The index splits words at spaces, which these scripts do not use, so each of their characters becomes a word. */
+export function forIndex(text: string): string {
+  return text.replace(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}ー]/gu, ' $& ');
+}
+
+const HOUR = 60 * 60 * 1000;
+const homeDir = () => process.env.VEILCRAWL_HOME ?? join(homedir(), '.veilcrawl');
+
+/** Forgets sites nobody crawled or read for a week, and what a crash left behind (a save takes seconds, not an hour). */
+export function deleteStale(): void {
+  if (!existsSync(homeDir())) return;
+  for (const name of readdirSync(homeDir())) {
+    const temp = name.match(/^s_[0-9a-f]{12}\.db(\.\d+\.tmp(?:-journal)?)?$/);
+    if (!temp) continue;
+    const path = join(homeDir(), name);
+    const stat = statSync(path, { throwIfNoEntry: false });
+    if (stat?.isFile() && Date.now() - stat.mtimeMs > (temp[1] ? HOUR : 7 * 24 * HOUR)) rmSync(path, { force: true });
+  }
+}
+
 function pathFor(siteId: string): string {
-  if (!/^s_[0-9a-f]{12}$/.test(siteId)) throw new VeilError('Unknown site_id. Run crawl_site first.');
-  return join(process.env.VEILCRAWL_HOME ?? join(homedir(), '.veilcrawl'), `${siteId}.db`);
+  if (!/^s_[0-9a-f]{12}$/.test(siteId)) throw new VeilError('Unknown or expired site_id. Run crawl_site first.');
+  return join(homeDir(), `${siteId}.db`);
 }
 
 /** Builds the index beside the live one and swaps it in, so a failed crawl never destroys an index. */
 export function writeSite(site: SiteRecord): void {
   const path = pathFor(site.id);
+  deleteStale();
   mkdirSync(join(path, '..'), { recursive: true, mode: 0o700 });
   const temp = `${path}.${process.pid}.tmp`;
   rmSync(temp, { force: true });
@@ -65,13 +84,13 @@ export function writeSite(site: SiteRecord): void {
       original: db.prepare('INSERT INTO originals VALUES (?, ?)'),
     };
     db.transaction(() => {
-      const meta: SiteMeta = { startUrl: site.startUrl, veilLevel: site.veilLevel, rawBytes: site.rawBytes, counts: site.counts };
+      const meta: SiteMeta = { veilLevel: site.veilLevel, rawBytes: site.rawBytes, counts: site.counts };
       db.prepare('INSERT INTO meta (json) VALUES (?)').run(JSON.stringify(meta));
       for (const page of site.pages) {
         const pageId = insert.page.run(page.url, page.title).lastInsertRowid;
-        for (const c of page.chunks) insert.chunkFts.run(insert.chunk.run(pageId, c.heading, c.text).lastInsertRowid, page.title, c.heading, c.text);
+        for (const c of page.chunks) insert.chunkFts.run(insert.chunk.run(pageId, c.heading, c.text).lastInsertRowid, forIndex(page.title), forIndex(c.heading), forIndex(c.text));
         for (const a of page.actions)
-          insert.actionFts.run(insert.action.run(pageId, a.role, a.label, a.actionType).lastInsertRowid, a.label, a.context, page.title);
+          insert.actionFts.run(insert.action.run(pageId, a.role, a.label, a.actionType).lastInsertRowid, forIndex(a.label), forIndex(a.context), forIndex(page.title));
       }
       for (const [placeholder, value] of site.originals) insert.original.run(placeholder, value);
     })();
@@ -85,8 +104,12 @@ export function writeSite(site: SiteRecord): void {
 
 export function openSite<T>(siteId: string, use: (db: Database.Database, meta: SiteMeta) => T): T {
   const path = pathFor(siteId);
-  if (!existsSync(path)) throw new VeilError('Unknown site_id. Run crawl_site first.');
-  const db = new Database(path, { fileMustExist: true });
+  deleteStale();
+  if (!existsSync(path)) throw new VeilError('Unknown or expired site_id. Run crawl_site first.');
+  const now = new Date();
+  utimesSync(path, now, now);
+  // Read-only: another process may swap the file at any moment, and writing to a swapped file corrupts it.
+  const db = new Database(path, { fileMustExist: true, readonly: true });
   try {
     const row = db.prepare('SELECT json FROM meta').get() as { json: string };
     return use(db, JSON.parse(row.json));

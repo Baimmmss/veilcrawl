@@ -24,21 +24,31 @@ export function parseRobots(text: string): Robots {
   const active = own.length ? own : groups.filter((g) => g.agents.includes('*'));
   const rules = active
     .flatMap((g) => g.rules)
-    .sort((a, b) => b.path.length - a.path.length || Number(b.allow) - Number(a.allow))
-    .map((r) => ({ allow: r.allow, regex: toRegex(r.path) }));
+    .sort((a, b) => b.path.length - a.path.length || Number(b.allow) - Number(a.allow));
   return {
     delayMs: Math.max(0, ...active.map((g) => g.delay)) * 1000,
     allowed(url) {
       const { pathname, search } = new URL(url);
-      return rules.find((r) => r.regex.test(pathname + search))?.allow ?? true;
+      return rules.find((r) => matches(r.path, pathname + search))?.allow ?? true;
     },
   };
 }
 
-function toRegex(path: string): RegExp {
-  const anchored = path.endsWith('$');
-  const body = (anchored ? path.slice(0, -1) : path).replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*+/g, '.*');
-  return new RegExp(`^${body}${anchored ? '$' : ''}`);
+// Not a RegExp: a rule with many "*" would backtrack for minutes.
+function matches(rule: string, target: string): boolean {
+  const anchored = rule.endsWith('$');
+  const parts = (anchored ? rule.slice(0, -1) : rule).split('*');
+  const first = parts.shift()!;
+  if (!target.startsWith(first)) return false;
+  if (anchored && !parts.length) return target === first;
+  const last = anchored ? parts.pop()! : '';
+  let at = first.length;
+  for (const part of parts) {
+    const found = target.indexOf(part, at);
+    if (found < 0) return false;
+    at = found + part.length;
+  }
+  return target.endsWith(last) && target.length - last.length >= at;
 }
 
 export async function fetchRobots(origin: string, userAgent: string): Promise<Robots> {
@@ -47,7 +57,14 @@ export async function fetchRobots(origin: string, userAgent: string): Promise<Ro
     const res = await fetch(`${origin}/robots.txt`, { headers: { 'user-agent': userAgent }, signal: AbortSignal.timeout(10_000) });
     // RFC 9309: a missing file allows everything, an unreachable one allows nothing.
     if (res.status >= 500) return none;
-    return parseRobots(res.ok ? (await res.text()).slice(0, 500_000) : '');
+    let text = '';
+    const decoder = new TextDecoder();
+    if (res.ok && res.body)
+      for await (const chunk of res.body) {
+        text += decoder.decode(chunk, { stream: true });
+        if (text.length > 500_000) break;
+      }
+    return parseRobots(text);
   } catch {
     return none;
   }

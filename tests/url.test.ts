@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { test } from 'node:test';
 import { inScope, normalizeUrl, urlKey } from '../src/url.ts';
-import { parseRobots } from '../src/robots.ts';
+import { fetchRobots, parseRobots } from '../src/robots.ts';
 
 test('normalizes tracking params, param order, fragments and credentials', () => {
   assert.equal(normalizeUrl('HTTPS://U:p@Example.com:443/a?utm_source=x&b=2&a=1&fbclid=9#top'), 'https://example.com/a?a=1&b=2');
@@ -37,4 +39,31 @@ test('robots: our own group overrides *', () => {
 test('robots: empty disallow and empty file allow everything', () => {
   assert.equal(parseRobots('User-agent: *\nDisallow:').allowed('https://x.com/a'), true);
   assert.equal(parseRobots('').allowed('https://x.com/a'), true);
+});
+test('robots: wildcards match in order, and anchors hold', () => {
+  const r = parseRobots('User-agent: *\nDisallow: /a*b*c$\nDisallow: /x$\nDisallow: /*aa$');
+  for (const [path, allowed] of [['/a1b2c', false], ['/a1c2b', true], ['/abcd', true], ['/abc', false], ['/x', false], ['/xy', true], ['/aaa', false]] as const)
+    assert.equal(r.allowed(`https://x.com${path}`), allowed, path);
+});
+test('robots: many wildcards cannot hang the crawl', () => {
+  const start = performance.now();
+  parseRobots(`User-agent: *\nDisallow: /${'*a'.repeat(30)}b`).allowed(`https://x.com/${'a'.repeat(1900)}`);
+  assert.ok(performance.now() - start < 500);
+});
+test('robots: an endless file is cut off, and its rules still apply', { timeout: 20_000 }, async () => {
+  const server = createServer((_, res) => {
+    res.writeHead(200).write('User-agent: *\nDisallow: /no\n');
+    const push = () => { while (!res.destroyed && res.write(Buffer.alloc(1 << 20, '#'))); };
+    res.on('drain', push).on('error', () => {});
+    push();
+  });
+  await new Promise<void>((r) => server.listen(0, r));
+  const before = process.memoryUsage().rss;
+  const origin = `http://localhost:${(server.address() as AddressInfo).port}`;
+  const robots = await fetchRobots(origin, 'x');
+  assert.ok(process.memoryUsage().rss - before < 300e6);
+  assert.equal(robots.allowed(`${origin}/no`), false);
+  assert.equal(robots.allowed(`${origin}/yes`), true);
+  server.closeAllConnections();
+  server.close();
 });

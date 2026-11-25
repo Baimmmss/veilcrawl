@@ -8,7 +8,7 @@ const fake = (prefix: string, n: number) => prefix + 'a1B2c3D4'.repeat(10).slice
 
 const MUST_REDACT: Record<string, string[]> = {
   EMAIL: ['john@example.com', 'john.o+tag@sub.example.co.uk', 'jo​hn@example.com', 'john@example.com', 'jösé@exämple.de'],
-  PHONE: ['(415) 555-2671', '415-555-2671', '415.555.2671', '4155552671', '+1 415 555 2671', '+14155552671', '+62 812-3456-7890', '0812-3456-7890', '081234567890', '020 7946 0958', '415‑555‑2671', '415–555–2671'],
+  PHONE: ['(415) 555-2671', '415-555-2671', '415.555.2671', '(415)5552671', '+1 415 555 2671', '+14155552671', '+62 812-3456-7890', '0812-3456-7890', '081234567890', '020 7946 0958', '415‑555‑2671', '415–555–2671'],
   SSN: ['123-45-6789', '123 45 6789'],
   CREDIT_CARD: ['4111111111111111', '4111 1111 1111 1111', '4111-1111-1111-1111', '378282246310005'],
   SECRET: [
@@ -140,4 +140,79 @@ test('a long integer is not a card just because some digits inside it look like 
 test('redacts a card with digits on both sides', () => {
   for (const s of ['12 4111 1111 1111 1111 2027', '4111111111111111 12-27', '99 4111111111111111'])
     assert.ok(!/4111|1111/.test(new Redactor().redact(s)), s);
+});
+
+test('redacts values joined to a word', () => {
+  for (const value of ['415-555-2671', '0812-3456-7890', '081234567890', fake('sk_live_', 24), fake('sk-proj-', 40), fake('ghp_', 36), `eyJ${'a'.repeat(20)}.eyJ${'b'.repeat(20)}.cc`])
+    for (const s of [`Label${value}`, `id_${value}`]) assert.ok(!new Redactor().redact(s).includes(value.slice(-6)), s);
+  for (const s of ['Phone4155552671', 'Call2125552671', 'phone 4155552671ext']) assert.ok(!/\d{4}/.test(new Redactor().redact(s)), s);
+});
+
+test('hyphenated words that contain "sk-" are not keys', () => {
+  for (const s of ['task-management-system-overview', 'disk-encryption-and-recovery', 'risk-based-authentication-v2']) assert.equal(new Redactor().redact(s), s);
+});
+
+test('strict mode hides IPv6 addresses but not times or code', () => {
+  for (const ip of ['2001:db8:85a3::8a2e:370:7334', 'fe80::1', '::1', '2001:0db8:0000:0000:0000:ff00:0042:8329'])
+    assert.equal(new Redactor('strict').redact(`host ${ip}.`), 'host [IP_1].', ip);
+  for (const s of ['at 12:34:56 today', 'std::add and foo::bar', 'a :: b']) assert.equal(new Redactor('strict').redact(s), s);
+});
+
+test('redacts whole emails with an apostrophe, keeping surrounding quotes', () => {
+  assert.equal(new Redactor().redact("o'brien@example.com"), '[EMAIL_1]');
+  assert.equal(new Redactor().redact("mail 'ann@example.com' now"), "mail '[EMAIL_1]' now");
+});
+
+test('redacts a card split into neighbouring boxes', () => {
+  const [chunk] = chunkBlocks(['4111', '1111', '1111', '1111'].map((text) => ({ heading: '', text, row: false })), new Redactor());
+  assert.equal(chunk.text, '[CREDIT_CARD_1]');
+});
+
+test('hostile text cannot make redaction slow', () => {
+  const n = 200_000;
+  for (const part of ['a', '1', '1 ', '1 · ', 'eyJ', 'sk-', 'token=', 'a@', 'a.', '+1', '(0', 'Bearer ', ':a', '-----BEGIN PRIVATE KEY-----', "a'"]) {
+    const start = performance.now();
+    new Redactor('strict').redact(part.repeat(n / part.length));
+    assert.ok(performance.now() - start < 3000, `${part}: ${Math.round(performance.now() - start)}ms`);
+  }
+});
+
+test('a custom pattern that runs away is stopped, not skipped', () => {
+  const start = performance.now();
+  assert.throws(() => new Redactor('standard', ['(a+)+$']).redact('a'.repeat(40) + '!'), /too slow/);
+  assert.ok(performance.now() - start < 5000);
+});
+
+test('hides a private key whose end marker is missing or far away', () => {
+  const out = new Redactor().redact(`-----BEGIN PRIVATE KEY-----\n${'MIIEabc '.repeat(500)}\n${'later text '.repeat(3000)}`);
+  assert.ok(!out.includes('MIIEabc'));
+});
+
+test('a bare number is a phone only next to a word that says so', () => {
+  for (const s of ['Phone: 4155552671', 'phone numbers 4155552671, 4155552672', 'Mobile · 4155552671', 'Call us at 4155552671', 'Telp 0215551234', 'Fax 4155552671'])
+    assert.ok(!/\d{9}/.test(new Redactor().redact(s)), s);
+  for (const s of ['max is 2147483647', 'uint 4294967295', 'ISBN 0306406152', 'the syscall returns 2147483647', 'cell value 4294967295'])
+    assert.equal(new Redactor().redact(s), s);
+});
+
+test('rows of ordinary numbers are not cards', () => {
+  let seed = 7;
+  const next = (n: number) => (seed = (seed * 48271) % 2147483647) % n;
+  for (let i = 0; i < 2000; i++) {
+    const small = Array.from({ length: 12 }, () => 1 + next(99)).join(' ');
+    const years = Array.from({ length: 5 }, () => 1990 + next(40)).join(' ');
+    for (const s of [small, years]) assert.ok(!new Redactor().redact(s).includes('CREDIT'), s);
+  }
+});
+
+test('redacts every real card layout, even after a year', () => {
+  for (const card of ['4111111111111111', '4111 1111 1111 1111', '3782 822463 10005', '3056 930902 5904', '5555-5555-5555-4444', '2223 0031 2200 3222', '6011000990139424', '4222222222222'])
+    for (const s of [`Card ${card} end`, `2020 ${card} 12`, `Card${card}`]) assert.match(new Redactor().redact(s), /\[CREDIT_CARD_1\]/, s);
+});
+
+test('hides session codes in paths without shortening other secrets', () => {
+  const r = new Redactor();
+  assert.ok(!r.redactUrl('https://x.com/a;jsessionid=1A2B3C4D?x=1').includes('1A2B'));
+  for (const u of ['https://x.com/?token=aaa;bbb', 'https://x.com/?token=aaa?bbb', 'https://x.com/a;session=aaa;v=1']) assert.ok(!/aaa|bbb/.test(r.redactUrl(u)), u);
+  assert.equal(r.redactUrl('https://x.com/a;v=1/b?x=1'), 'https://x.com/a;v=1/b?x=1');
 });

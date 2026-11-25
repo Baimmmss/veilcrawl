@@ -13,7 +13,7 @@ Crawl once, index locally, and answer with small, redacted snippets.
 ![MCP server](https://img.shields.io/badge/MCP-server-6E56CF)
 ![Status: early](https://img.shields.io/badge/status-early%20(v0.1)-orange)
 
-[Quick start](#quick-start) · [Tools](#tools) · [How it works](#how-it-works) · [Privacy](#privacy) · [Configuration](#configuration)
+[Quick start](#quick-start) · [Use cases](#use-cases) · [Tools](#tools) · [How it works](#how-it-works) · [Privacy](#privacy) · [Configuration](#configuration)
 
 </div>
 
@@ -130,6 +130,75 @@ node dist/cli.js direct_search s_0bd11525fdbe open database connection --top_k 1
 > [!TIP]
 > Large crawls can outlast an MCP client's timeout. Run them from the command line and give the agent the `site_id`.
 
+## Use cases
+
+Real runs, captured on 25 November 2026. Sites change, so your results may differ. `node dist/cli.js` is shortened to `veilcrawl`, and only the key fields are shown.
+
+### Answer a question from long documentation
+
+> Which Python setting controls sqlite3 transactions?
+
+```sh
+veilcrawl crawl_site https://docs.python.org/3/library/sqlite3.html --max_pages 8 --max_depth 1
+veilcrawl direct_search s_0bd11525fdbe default isolation level transaction --top_k 1
+```
+
+```text
+If Connection.autocommit is set to LEGACY_TRANSACTION_CONTROL (the default), transaction
+behaviour is controlled using the Connection.isolation_level attribute. Otherwise,
+isolation_level has no effect.
+```
+
+The agent read about 140 tokens: 45 from the crawl and 96 from the search. See [Measured results](#measured-results) for what it would read otherwise.
+
+### Read a contact page without seeing the contact details
+
+> Can I get professional support for SQLite?
+
+```sh
+veilcrawl crawl_site https://sqlite.org/support.html --max_pages 8 --max_depth 1
+veilcrawl direct_search s_02d149a916eb email contact professional support --top_k 3
+```
+
+```text
+If you would like professional support for SQLite or if you want custom modifications …
+… Applied Software Research [PHONE_1] [EMAIL_1] | More Info
+```
+
+The agent learns that support exists and where to look. The phone number and email stay on your computer. Names are not hidden.
+
+### Find a button without clicking through the site
+
+> Where do I download the Node.js installer?
+
+```sh
+veilcrawl crawl_site https://nodejs.org/en/download --max_pages 8 --max_depth 1
+veilcrawl find_action s_34c1e9411b53 download installer --top_k 1
+```
+
+```text
+Windows Installer (.msi)   button   https://nodejs.org/en/download
+```
+
+### Search a site in another language
+
+> 在维基百科的 SQLite 页面里查找“事务”。
+
+```sh
+veilcrawl crawl_site https://zh.wikipedia.org/wiki/SQLite --max_pages 3 --max_depth 1
+veilcrawl direct_search s_87a1bc3e9425 事务 --top_k 1
+```
+
+```text
+程式庫实现了多数的SQL-92标准,包括事务,以及实现原子性、一致性、隔離性和持久性(即ACID),但它缺失了某些特性。…
+```
+
+### Where it does not fit
+
+- **Pages behind a login:** VeilCrawl does not sign in.
+- **Clicking or filling in forms:** it finds controls but cannot use them yet.
+- **Questions with no shared words:** search matches words, not meaning. "Convert row to dictionary" missed an answer in the Python pages above that says "returns each row as a dict". Searching "row_factory dict" finds it.
+
 ## Tools
 
 The MCP server and the command line share the same six tools.
@@ -141,7 +210,7 @@ The MCP server and the command line share the same six tools.
 | `find_action` | Finds buttons, links, forms and downloads. | `top_k` 5 |
 | `site_map` | Shows a compact tree of routes. | `max_tokens` 200 |
 | `peek_chunk` | Reads one search hit, with its neighbours if asked. | `window` 0 or 1 |
-| `veil_audit` | Reports redaction counts and tokens saved. | |
+| `veil_audit` | Reports redaction counts and tokens saved per search. | |
 
 ## How it works
 
@@ -179,16 +248,17 @@ To see what was hidden, run `node dist/cli.js veil_audit <site_id> --audit`. It 
 > [!WARNING]
 > **Know the limits before using this on sensitive sites.**
 > - Redaction is pattern-based. It misses names, street addresses and disguised values, and sometimes hides harmless numbers.
-> - The agent chooses `veil_level`, so it can crawl a `strict` site again as `standard`.
+> - The agent chooses `veil_level` and can crawl a `strict` site again as `standard`, unless you set `VEILCRAWL_VEIL=strict`.
 > - Index files keep the original redacted values for the audit. Only your user account can read them, but that includes any agent with shell access.
 
-Indexes are stored in `~/.veilcrawl`. Delete `<site_id>.db` to forget a site.
+Indexes are stored in `~/.veilcrawl`. A site that nobody crawls or reads for 7 days is deleted the next time VeilCrawl is used. Delete `<site_id>.db` to forget a site sooner.
 
 ## Configuration
 
 | Variable | Effect | Default |
 | :--- | :--- | :--- |
 | `VEILCRAWL_HOME` | Where indexes are stored | `~/.veilcrawl` |
+| `VEILCRAWL_VEIL` | `strict` forces strict mode on every crawl, whatever the agent asks for | `standard` |
 | `VEILCRAWL_ENGINE` | `auto`, `lightpanda` or `chromium` | `auto` |
 | `LIGHTPANDA_PATH` | Path to the Lightpanda binary | Found automatically |
 
@@ -208,11 +278,26 @@ These `crawl_site` options work only from the command line, so an agent cannot c
 
 | Target | Goal | Measured |
 | :--- | :--- | :--- |
-| Search latency, P95, 500 pages | under 100 ms | 27–41 ms |
-| Tokens compared with raw HTML | at least 95% fewer | 99.6% fewer on a 12-page crawl |
+| Search latency, P95, 500 pages | under 100 ms | 27–67 ms |
 | Planted secrets reaching the agent | 0 | 0 of 23 |
 
 <sub>Measured on one macOS machine. Latency rises under heavy CPU load. The secrets test runs as part of <code>npm test</code>.</sub>
+
+### Tokens
+
+What an agent would read for the three English use cases above:
+
+| | Python docs | SQLite support | Node.js download |
+| :--- | ---: | ---: | ---: |
+| All 8 pages, raw HTML | 429,558 | 55,086 | 1,211,909 |
+| All 8 pages, clean text | 59,189 | 7,036 | 9,482 |
+| Only the right page, clean text | 15,868 | 394 | 568 |
+| **VeilCrawl, crawl and search** | **about 140** | **about 215** | **about 85** |
+
+- **Large savings on long pages,** or when the agent does not know which page has the answer.
+- **Little or no saving on one short page.** The tool descriptions add about 740 tokens to a conversation, so if the agent already knows the right SQLite or Node.js page, reading it directly is cheaper.
+
+<sub>Counted with gpt-tokenizer on 25 November 2026; other models count differently. Clean text is the browser's visible text. Each search is capped at 250 tokens by default.</sub>
 
 ## Development
 

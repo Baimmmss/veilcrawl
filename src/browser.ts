@@ -12,6 +12,8 @@ export type BrowserEngine = 'auto' | 'lightpanda' | 'chromium';
 export interface BrowserSession {
   browser: Browser;
   engine: 'lightpanda' | 'chromium';
+  /** Lightpanda only: a page that hangs freezes its whole connection, so each page gets its own. */
+  connect?(): Promise<Browser>;
   close(): Promise<void>;
 }
 
@@ -136,6 +138,7 @@ async function launchLightpanda(timeoutMs: number): Promise<BrowserSession> {
     return {
       browser,
       engine: 'lightpanda',
+      connect: () => chromium.connectOverCDP(endpoint),
       async close() {
         await browser.close().catch(() => {});
         await killProc();

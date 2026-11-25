@@ -73,7 +73,7 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
       if (!(await robotsFor(url)).allowed(url)) return 'robots';
       let page: Page | undefined;
       try {
-        page = await context.newPage();
+        page = await (session.connect ? (await session.connect()).newPage() : context.newPage());
         page.on('popup', (popup) => void popup.close().catch(() => {}));
         // After the tab exists: its startup time must not eat into the gap between loads.
         await waitTurn(url);
@@ -84,13 +84,16 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
         const landed = normalizeUrl(page.url());
         if (!landed || !inScope(landed, start)) return 'off_site';
         if (!(await robotsFor(landed)).allowed(landed)) return 'robots';
-        const data = await page.evaluate(extractPage, args.redact_selectors);
+        // evaluate has no timeout of its own, and a script that never ends would block it forever.
+        const data = await Promise.race([page.evaluate(extractPage, args.redact_selectors), sleep(timeout_ms, null, { ref: false })]);
+        if (!data) return 'failed';
         // A script may have navigated while we were reading.
         return normalizeUrl(page.url()) === landed ? { url: landed, data } : 'failed';
       } catch {
         return 'failed';
       } finally {
-        await page?.close().catch(() => {});
+        // Not awaited: Lightpanda cannot close a tab while its script is running.
+        void (session.connect ? page?.context().browser() : page)?.close().catch(() => {});
       }
     };
 

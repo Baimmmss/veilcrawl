@@ -11,7 +11,7 @@ Crawl once, index locally, and answer with small, redacted snippets.
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
 ![Browser: Lightpanda](https://img.shields.io/badge/browser-Lightpanda-F5A623)
 ![MCP server](https://img.shields.io/badge/MCP-server-6E56CF)
-![Status: early](https://img.shields.io/badge/status-early%20(v0.1)-orange)
+![Status: early](https://img.shields.io/badge/status-early%20(v0.2)-orange)
 
 [Quick start](#quick-start) · [Use cases](#use-cases) · [Tools](#tools) · [How it works](#how-it-works) · [Privacy](#privacy) · [Configuration](#configuration)
 
@@ -25,7 +25,7 @@ Agents usually read websites one full page at a time. That is slow, fills the co
 
 | | Browsing page by page | VeilCrawl |
 | :--- | :--- | :--- |
-| **Finding a fact** | Open pages until it turns up | One search across every indexed page |
+| **Finding a fact** | Open pages until it turns up | One search across every indexed page, by words and by meaning |
 | **What the model sees** | Whole pages | Ranked snippets, 250 tokens by default |
 | **Emails, keys, card numbers** | Sent as they are | Replaced on your machine with `[EMAIL_1]`, `[SECRET_1]` |
 | **Asking again** | Load the pages again | Local index, no new requests |
@@ -69,18 +69,29 @@ npx playwright install chromium --only-shell
 ### 2. Install VeilCrawl
 
 ```sh
+npm install -g veilcrawl
+```
+
+This includes local semantic search, which adds about 230 MB of runtime. To skip it and search by words only, add `--omit=optional`.
+
+<details>
+<summary><b>From source</b></summary>
+
+```sh
 git clone https://github.com/Baimmmss/veilcrawl.git
 cd veilcrawl
 npm install
-npm run build
+npm link
 ```
+
+</details>
 
 ### 3. Connect an agent
 
 **Claude Code**
 
 ```sh
-claude mcp add --scope user veilcrawl -- node "$PWD/dist/cli.js" mcp
+claude mcp add --scope user veilcrawl -- veilcrawl mcp
 ```
 
 <details>
@@ -90,12 +101,14 @@ claude mcp add --scope user veilcrawl -- node "$PWD/dist/cli.js" mcp
 {
   "mcpServers": {
     "veilcrawl": {
-      "command": "node",
-      "args": ["/absolute/path/to/veilcrawl/dist/cli.js", "mcp"]
+      "command": "veilcrawl",
+      "args": ["mcp"]
     }
   }
 }
 ```
+
+If the client cannot find `veilcrawl`, use the full path from `which veilcrawl`.
 
 </details>
 
@@ -106,8 +119,8 @@ Then ask in plain language:
 ### Or use the command line
 
 ```sh
-node dist/cli.js crawl_site https://docs.python.org/3/library/sqlite3.html --max_pages 12 --max_depth 1
-node dist/cli.js direct_search s_0bd11525fdbe open database connection --top_k 1
+veilcrawl crawl_site https://docs.python.org/3/library/sqlite3.html --max_pages 12 --max_depth 1
+veilcrawl direct_search s_0bd11525fdbe open database connection --top_k 1
 ```
 
 ```json
@@ -119,7 +132,7 @@ node dist/cli.js direct_search s_0bd11525fdbe open database connection --top_k 1
       "url": "https://docs.python.org/3/library/sqlite3.html",
       "title": "sqlite3 — DB-API 2.0 interface for SQLite databases — Pyth…",
       "snippet": "sqlite3 ensures that a transaction is always open, so connect(), Connection.commit(), and …",
-      "score": 8.85
+      "score": 0.0325
     }
   ]
 }
@@ -132,7 +145,7 @@ node dist/cli.js direct_search s_0bd11525fdbe open database connection --top_k 1
 
 ## Use cases
 
-Real runs, captured on 25 November 2026. Sites change, so your results may differ. `node dist/cli.js` is shortened to `veilcrawl`, and only the key fields are shown.
+Real runs, captured on 25 and 27 November 2026. Sites change, so your results may differ. Only the key fields are shown.
 
 ### Answer a question from long documentation
 
@@ -167,6 +180,20 @@ If you would like professional support for SQLite or if you want custom modifica
 
 The agent learns that support exists and where to look. The phone number and email stay on your computer. Names are not hidden.
 
+### Find an answer that uses other words
+
+> How do I turn a row into a dictionary?
+
+```sh
+veilcrawl direct_search s_0bd11525fdbe convert row to dictionary --top_k 2
+```
+
+```text
+You can create a custom row_factory that returns each row as a dict, with column names mapped to values:
+```
+
+No passage contains "convert row to dictionary", so a word search returns passages about type converters. Semantic search finds the answer as the second hit.
+
 ### Find a button without clicking through the site
 
 > Where do I download the Node.js installer?
@@ -196,8 +223,8 @@ veilcrawl direct_search s_87a1bc3e9425 事务 --top_k 1
 ### Where it does not fit
 
 - **Pages behind a login:** VeilCrawl does not sign in.
-- **Clicking or filling in forms:** it finds controls but cannot use them yet.
-- **Questions with no shared words:** search matches words, not meaning. "Convert row to dictionary" missed an answer in the Python pages above that says "returns each row as a dict". Searching "row_factory dict" finds it.
+- **Clicking or filling in forms:** it finds controls but cannot use them yet. It opens tabs and accordions while crawling, and nothing else.
+- **Meaning in other languages:** semantic search uses an English model. Other languages are searched by words only.
 
 ## Tools
 
@@ -206,7 +233,7 @@ The MCP server and the command line share the same six tools.
 | Tool | What it does | Main options |
 | :--- | :--- | :--- |
 | `crawl_site` | Crawls and indexes a site. Returns statistics, never content. | `max_pages` 50 · `max_depth` 3 · `veil_level` · `redact_patterns` · `redact_selectors` |
-| `direct_search` | Searches every indexed page. | `top_k` 5 · `max_tokens` 250 |
+| `direct_search` | Searches every indexed page, by words and by meaning. | `top_k` 5 · `max_tokens` 250 |
 | `find_action` | Finds buttons, links, forms and downloads. | `top_k` 5 |
 | `site_map` | Shows a compact tree of routes. | `max_tokens` 200 |
 | `peek_chunk` | Reads one search hit, with its neighbours if asked. | `window` 0 or 1 |
@@ -217,15 +244,20 @@ The MCP server and the command line share the same six tools.
 ```mermaid
 flowchart LR
     Agent["AI agent or CLI"] -->|crawl_site| Crawler["Crawler<br/>Lightpanda"]
-    Crawler --> Extract["Strip boilerplate"]
+    Crawler -->|"page text, opened tabs,<br/>the site's JSON replies"| Extract["Strip boilerplate"]
     Extract --> Redact["Redact, then split<br/>into small chunks"]
-    Redact --> Index[("Local SQLite index")]
+    Redact --> Index[("Local SQLite index<br/>words + meaning vectors")]
     Agent -->|"search · find · map · peek"| Budget["Token budget"]
     Index --> Budget
     Budget -->|snippets only| Agent
 ```
 
 Text is redacted **before** it is indexed, so a hidden value cannot be found by searching for it.
+
+- **Search** ranks passages by matching words (SQLite FTS5) and by meaning (a small local model, [all-MiniLM-L6-v2](https://huggingface.co/Xenova/all-MiniLM-L6-v2)), then merges both lists with reciprocal rank fusion. The model runs on your machine. It reads only redacted text and the agent's query.
+- **Single-page apps:** before reading a page, the crawler opens `<details>`, accordions and every tab, so text that appears only after a click is indexed. It does not click links, menus or form controls.
+- **API replies:** JSON that the site's own pages fetch from the same host is indexed too, one row per object. Fields named like secrets (`token`, `password`, `api_key` and similar) are dropped, and the rest is redacted like page text.
+- **Duplicates:** a page with no text or control that an earlier page lacked, such as a list sorted another way, is skipped, and its links are not followed. This stops sort, filter and paging loops.
 
 The crawler stays on the starting host, obeys `robots.txt`, waits between page loads, identifies itself as VeilCrawl, and does not bypass logins or CAPTCHAs.
 
@@ -234,12 +266,12 @@ The crawler stays on the starting host, obeys `robots.txt`, waits between page l
 | Mode | Behaviour |
 | :--- | :--- |
 | `standard` | Redacts emails, phone numbers, US Social Security numbers, card numbers, and API keys and tokens |
-| `strict` | Also redacts IP addresses, UUIDs and long numbers, caps snippets at 120 characters, and leaves titles out of the site map |
+| `strict` | Also redacts IP addresses, UUIDs and long numbers, caps snippets at 120 characters, leaves titles out of the site map, and does not index API replies |
 
 Add your own rules when you crawl:
 
 ```sh
-node dist/cli.js crawl_site https://example.com --veil_level strict \
+veilcrawl crawl_site https://example.com --veil_level strict \
   --redact_patterns 'acme-\d+' --redact_selectors '.internal'
 ```
 
@@ -252,7 +284,10 @@ To see what was hidden, add `--audit` to `crawl_site`. It prints the hidden valu
 > - Redaction is pattern-based. It misses names, street addresses and disguised values, and sometimes hides harmless numbers.
 > - The agent chooses `veil_level` the first time it crawls a site, unless you set `VEILCRAWL_VEIL=strict`.
 > - Settings belong to one host and port. The same pages under another name, such as a subdomain or an IP address, are a separate site.
+> - API replies often hold more than the page shows. They are indexed only on `standard` sites without `redact_selectors`, because a selector cannot hide a value inside JSON. Use `strict`, or any `redact_selectors`, to keep them out.
 > - Hidden values are not saved, but an agent with shell access can read the redacted index and your `redact_patterns`, delete the saved settings, or open the site without VeilCrawl.
+
+The first crawl downloads the 23 MB search model from Hugging Face into `~/.veilcrawl/models`. It sends no page content and no queries. After that, VeilCrawl works offline. If the download fails, search falls back to matching words.
 
 Indexes are stored in `~/.veilcrawl`. A site that nobody crawls or reads for 7 days is deleted the next time VeilCrawl is used. Delete `<site_id>.db` to forget a site sooner. The settings in `veils` are kept until you delete them. Indexes made by an older version are deleted when used, so crawl those sites again.
 
@@ -263,6 +298,7 @@ Indexes are stored in `~/.veilcrawl`. A site that nobody crawls or reads for 7 d
 | `VEILCRAWL_HOME` | Where indexes are stored | `~/.veilcrawl` |
 | `VEILCRAWL_VEIL` | `strict` forces strict mode on every crawl, whatever the agent asks for | `standard` |
 | `VEILCRAWL_ENGINE` | `auto`, `lightpanda` or `chromium` | `auto` |
+| `VEILCRAWL_SEMANTIC` | `off` turns semantic search off and never downloads the model | On |
 | `LIGHTPANDA_PATH` | Path to the Lightpanda binary | Found automatically |
 
 `auto` uses Lightpanda when it is installed and Chromium otherwise. Lightpanda is looked for in `LIGHTPANDA_PATH`, `PATH`, `~/.local/bin`, `/usr/local/bin` and `/opt/homebrew/bin`.
@@ -281,10 +317,11 @@ These `crawl_site` options work only from the command line, so an agent cannot c
 
 | Target | Goal | Measured |
 | :--- | :--- | :--- |
-| Search latency, P95, 500 pages | under 100 ms | 27–67 ms |
+| Search latency, P95, 500 pages, words only | under 100 ms | 27–67 ms |
+| Search latency, P95, 500 pages, words and meaning | under 100 ms | 92 ms, about 50 ms typical |
 | Planted secrets reaching the agent | 0 | 0 of 23 |
 
-<sub>Measured on one macOS machine. Latency rises under heavy CPU load. The secrets test runs as part of <code>npm test</code>.</sub>
+<sub>Measured on one Intel macOS machine; words and meaning under a load average of about 19. Latency rises under heavy CPU load. The first search after starting also loads the model, which takes about a second. The secrets test runs as part of <code>npm test</code>.</sub>
 
 ### Tokens
 
@@ -310,10 +347,16 @@ npm run typecheck
 npm run build
 ```
 
+`npm test` turns semantic search off, except in one test that downloads the model once into `node_modules/.cache`.
+
+To release, bump `version` in `package.json` and `src/mcp.ts`, then run `npm test` and `npm publish`. Publishing builds `dist` first.
+
+`npm audit` in a project that installs VeilCrawl reports `sharp`, an image library that the search model's package requires. VeilCrawl never decodes images. Transformers 4, which fixes this, no longer runs on Intel Macs. Install with `--omit=optional` to leave it out.
+
 ## Roadmap
 
 - [x] **Phase 1:** crawler, local search, redaction, MCP server and CLI
-- [ ] **Phase 2:** semantic search, API response indexing, better single-page app support
+- [x] **Phase 2:** semantic search, API response indexing, tab and accordion expansion, duplicate-loop skipping
 - [ ] **Phase 3:** running actions through handles, incremental crawls, local dashboard
 
 See [PRD.md](PRD.md) for the full plan.

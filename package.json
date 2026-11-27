@@ -1,9 +1,26 @@
 {
   "name": "veilcrawl",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Direct-search & blindfolded headless-browser web engine for AI agents (MCP + CLI)",
   "license": "MIT",
-  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Baimmmss/veilcrawl.git"
+  },
+  "homepage": "https://github.com/Baimmmss/veilcrawl#readme",
+  "bugs": "https://github.com/Baimmmss/veilcrawl/issues",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "ai-agents",
+    "crawler",
+    "search",
+    "semantic-search",
+    "privacy",
+    "redaction",
+    "lightpanda",
+    "playwright"
+  ],
   "type": "module",
   "engines": {
     "node": ">=22.18"
@@ -11,10 +28,14 @@
   "bin": {
     "veilcrawl": "dist/cli.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
-    "test": "node --test --test-concurrency=1 'tests/*.test.ts'",
-    "typecheck": "tsc --noEmit"
+    "test": "VEILCRAWL_SEMANTIC=off node --test --test-concurrency=1 'tests/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
@@ -26,5 +47,11 @@
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.20.5",
     "typescript": "^7.0.2"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.8.1"
+  },
+  "overrides": {
+    "sharp": "^0.35.4"
   }
 }

@@ -1,4 +1,4 @@
-import type { Redactor } from './redactor.ts';
+import { SENSITIVE_PARAM, type Redactor } from './redactor.ts';
 
 export interface Block {
   heading: string;
@@ -7,6 +7,7 @@ export interface Block {
 }
 
 const MAX_CHARS = 300;
+const MAX_API_ROWS = 300;
 const segmenter = new Intl.Segmenter('en', { granularity: 'sentence' });
 
 /** Turns page blocks into redacted micro-chunks. Redaction runs on whole blocks, before any splitting. */
@@ -54,4 +55,28 @@ function hardWrap(text: string): string[] {
     rest = rest.slice(at).trim();
   }
   return [...parts, rest];
+}
+
+/**
+ * Text fields of a JSON reply, one row per object as "key: value | key: value". Not redacted yet.
+ * Fields named like a secret are dropped, and so are long strings without spaces (ids, hashes, base64).
+ */
+export function jsonBlocks(value: unknown, heading: string): Block[] {
+  const blocks: Block[] = [];
+  const visit = (node: unknown, depth: number): void => {
+    if (blocks.length >= MAX_API_ROWS || depth > 20 || !node || typeof node !== 'object') return;
+    if (Array.isArray(node)) return node.forEach((item) => visit(item, depth + 1));
+    const fields: string[] = [];
+    for (const [key, field] of Object.entries(node)) {
+      if (SENSITIVE_PARAM.test(key)) continue;
+      if (field && typeof field === 'object') visit(field, depth + 1);
+      else if (typeof field === 'string' || typeof field === 'number' || typeof field === 'boolean') {
+        const text = String(field).replace(/\s+/g, ' ').trim();
+        if (text && !(text.length > 200 && !text.includes(' '))) fields.push(`${key}: ${text}`);
+      }
+    }
+    if (fields.length) blocks.push({ heading, text: fields.join(' | '), row: true });
+  };
+  visit(value, 0);
+  return blocks;
 }

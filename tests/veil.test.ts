@@ -179,7 +179,7 @@ test('hostile text cannot make redaction slow', () => {
 
 test('a custom pattern that runs away is stopped, not skipped', () => {
   const start = performance.now();
-  assert.throws(() => new Redactor('standard', ['(a+)+$']).redact('a'.repeat(40) + '!'), /too slow/);
+  assert.throws(() => new Redactor('standard', ['(a+)+$']).redact('a'.repeat(40) + '!'), (e: Error) => /too slow/.test(e.message) && !e.message.includes('(a+)'));
   assert.ok(performance.now() - start < 5000);
 });
 

@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { VeilError } from './errors.ts';
@@ -21,6 +22,8 @@ export interface Veil {
 
 export interface SiteMeta extends Veil {
   host: string;
+  /** Unique per index file. Missing in indexes made by older versions. */
+  built?: string;
   rawBytes: number;
   counts: Record<string, number>;
 }
@@ -29,6 +32,8 @@ export interface SiteMeta extends Veil {
 export interface SiteRecord extends SiteMeta {
   id: string;
   pages: PageRecord[];
+  /** One unit-length sentence vector per chunk, in page and chunk order, when semantic search is on. */
+  vectors?: Float32Array | null;
 }
 
 const SCHEMA = `
@@ -38,6 +43,8 @@ const SCHEMA = `
   CREATE INDEX chunks_page ON chunks (page_id);
   CREATE VIRTUAL TABLE chunks_fts USING fts5 (title, heading, text, tokenize = 'porter unicode61');
   CREATE TABLE actions (id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL, action_type TEXT NOT NULL);
+  -- One blob holds every vector, one signed byte per number: row i belongs to chunk id i + 1. Reading 10k small rows is too slow.
+  CREATE TABLE vectors (data BLOB NOT NULL);
   CREATE VIRTUAL TABLE actions_fts USING fts5 (label, context, title, tokenize = 'porter unicode61');
 `;
 
@@ -47,7 +54,7 @@ export function forIndex(text: string): string {
 }
 
 const HOUR = 60 * 60 * 1000;
-const homeDir = () => process.env.VEILCRAWL_HOME ?? join(homedir(), '.veilcrawl');
+export const homeDir = () => process.env.VEILCRAWL_HOME ?? join(homedir(), '.veilcrawl');
 
 /** Forgets sites nobody crawled or read for a week, and what a crash left behind (a save takes seconds, not an hour). */
 export function deleteStale(): void {
@@ -115,14 +122,15 @@ export function writeSite(site: SiteRecord): void {
       actionFts: db.prepare('INSERT INTO actions_fts (rowid, label, context, title) VALUES (?, ?, ?, ?)'),
     };
     db.transaction(() => {
-      const { id, pages, ...meta } = site;
-      db.prepare('INSERT INTO meta (json) VALUES (?)').run(JSON.stringify(meta));
+      const { id, pages, vectors, ...meta } = site;
+      db.prepare('INSERT INTO meta (json) VALUES (?)').run(JSON.stringify({ ...meta, built: randomUUID() }));
       for (const page of pages) {
         const pageId = insert.page.run(page.url, page.title).lastInsertRowid;
         for (const c of page.chunks) insert.chunkFts.run(insert.chunk.run(pageId, c.heading, c.text).lastInsertRowid, forIndex(page.title), forIndex(c.heading), forIndex(c.text));
         for (const a of page.actions)
           insert.actionFts.run(insert.action.run(pageId, a.role, a.label, a.actionType).lastInsertRowid, forIndex(a.label), forIndex(a.context), forIndex(page.title));
       }
+      if (vectors) db.prepare('INSERT INTO vectors VALUES (?)').run(Buffer.from(Int8Array.from(vectors, (x) => Math.round(x * 127)).buffer));
     })();
     db.close();
     keepVeil(site.host, site);
@@ -131,6 +139,29 @@ export function writeSite(site: SiteRecord): void {
     db.close();
     rmSync(temp, { force: true });
   }
+}
+
+/** Vectors of recently searched sites by index build: reading them takes longer than the search. */
+const vectorCache = new Map<string, Int8Array>();
+
+// shortcut: scans every vector (about 20 ms per 10k chunks), switch to sqlite-vec if sites grow past ~100k chunks.
+/** Chunk ids closest in meaning to `query`, best first, at least `minSimilarity` alike. Empty without vectors. */
+export function nearest(db: Database.Database, meta: SiteMeta, query: Float32Array, limit: number, minSimilarity: number): number[] {
+  let vectors = vectorCache.get(meta.built!);
+  if (!vectors) {
+    const blob = db.prepare('SELECT data FROM vectors').pluck().get() as Buffer | undefined;
+    vectors = blob ? new Int8Array(blob) : new Int8Array(0);
+    vectorCache.set(meta.built!, vectors);
+    if (vectorCache.size > 8) vectorCache.delete(vectorCache.keys().next().value!);
+  }
+  const dims = query.length;
+  const best: { id: number; sim: number }[] = [];
+  for (let row = 0; row * dims < vectors.length; row++) {
+    let sum = 0;
+    for (let i = 0, at = row * dims; i < dims; i++) sum += vectors[at + i] * query[i];
+    if (sum / 127 >= minSimilarity) best.push({ id: row + 1, sim: sum });
+  }
+  return best.sort((a, b) => b.sim - a.sim).slice(0, limit).map((b) => b.id);
 }
 
 export function openSite<T>(siteId: string, use: (db: Database.Database, meta: SiteMeta) => T): T {
@@ -142,11 +173,10 @@ export function openSite<T>(siteId: string, use: (db: Database.Database, meta: S
   try {
     const row = db.prepare('SELECT json FROM meta').get() as { json: string };
     const meta = JSON.parse(row.json) as SiteMeta;
-    // No host: made by a version that also stored the redacted values.
-    if (!meta.host || hidesLess(meta, keptVeil(meta.host))) {
-      rmSync(path, { force: true });
-      throw unknownSite();
-    }
+    // Made by an older version: some stored the redacted values, and none has the tables search now reads.
+    if (!meta.built) rmSync(path, { force: true });
+    // Not deleted: another process may have just swapped a stronger index into this path.
+    if (!meta.built || hidesLess(meta, keptVeil(meta.host))) throw unknownSite();
     const now = new Date();
     utimesSync(path, now, now);
     return use(db, meta);

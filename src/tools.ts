@@ -2,11 +2,16 @@ import { z } from 'zod';
 import { estimateTokens, fitBudget, snippet } from './budget.ts';
 import { crawlSite, type LocalCrawlOptions } from './crawler.ts';
 import { VeilError } from './errors.ts';
-import { forIndex, openSite } from './store.ts';
+import { embed } from './embed.ts';
+import { forIndex, nearest, openSite } from './store.ts';
 
 const SEARCH_TOKENS = 250;
 const FIND_ACTION_TOKENS = 250;
 const PEEK_TOKENS = 300;
+/** How many results of each search are fused. */
+const FUSE_DEPTH = 50;
+/** all-MiniLM-L6-v2 puts unrelated text below about 0.2 and paraphrases above 0.4. */
+const MIN_SIMILARITY = 0.35;
 
 const siteId = z.string().describe('site_id returned by crawl_site');
 const topK = z.coerce.number().int().min(1).max(20).default(5);
@@ -51,20 +56,29 @@ export const tools = [
 
   tool(
     'direct_search',
-    'Search every indexed page of a site in one call. Returns short redacted snippets.',
+    'Search every indexed page of a site in one call, by words and by meaning. Returns short redacted snippets.',
     ['site_id', 'query'],
     z.object({ site_id: siteId, query: z.string(), top_k: topK, max_tokens: maxTokens(SEARCH_TOKENS) }),
-    (args) =>
-      openSite(args.site_id, (db, meta) => {
-        const terms = termsOf(args.query);
+    async (args) => {
+      const terms = termsOf(args.query);
+      // Checked first: loading the model for a site crawled without it would be wasted.
+      const semantic = terms.length && openSite(args.site_id, (db) => !!db.prepare('SELECT 1 FROM vectors').get());
+      const query = semantic ? await embed([args.query]) : null;
+      return openSite(args.site_id, (db, meta) => {
         if (!terms.length) return { full_matches: 0, hits: [] };
-        const rows = db
-          .prepare(
-            `SELECT c.id, p.url, p.title, c.text, bm25(chunks_fts, 3, 2, 1) AS rank
-             FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid JOIN pages p ON p.id = c.page_id
-             WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?`,
-          )
-          .all(ftsQuery(terms, 'OR'), args.top_k) as { id: number; url: string; title: string; text: string; rank: number }[];
+        const keyword = db
+          .prepare(`SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts, 3, 2, 1) LIMIT ${FUSE_DEPTH}`)
+          .pluck()
+          .all(ftsQuery(terms, 'OR')) as number[];
+        const similar = query ? nearest(db, meta, query, FUSE_DEPTH, MIN_SIMILARITY) : [];
+        // Reciprocal rank fusion: near the top of either list ranks high, in both lists ranks higher.
+        const scores = new Map<number, number>();
+        for (const list of [keyword, similar]) list.forEach((id, rank) => scores.set(id, (scores.get(id) ?? 0) + 1 / (61 + rank)));
+        const get = db.prepare('SELECT p.url, p.title, c.text FROM chunks c JOIN pages p ON p.id = c.page_id WHERE c.id = ?');
+        const rows = [...scores]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, args.top_k)
+          .map(([id, score]) => ({ id, score, ...(get.get(id) as { url: string; title: string; text: string }) }));
         const { n } = db.prepare('SELECT count(*) AS n FROM chunks_fts WHERE chunks_fts MATCH ?').get(ftsQuery(terms, 'AND')) as { n: number };
         return fitBudget(rows, args.max_tokens, meta.veilLevel === 'strict' ? 120 : 280, (items, chars) => ({
           full_matches: n,
@@ -73,10 +87,11 @@ export const tools = [
             url: snippet(r.url, 120),
             title: snippet(r.title, 60),
             snippet: snippet(r.text, chars, terms),
-            score: Math.round(-r.rank * 100) / 100,
+            score: Math.round(r.score * 1e4) / 1e4,
           })),
         }));
-      }),
+      });
+    },
   ),
 
   tool(

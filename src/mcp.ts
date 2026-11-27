@@ -5,7 +5,7 @@ import { deleteStale } from './store.ts';
 import { tools } from './tools.ts';
 
 export function createMcpServer(): McpServer {
-  const server = new McpServer({ name: 'veilcrawl', version: '0.1.0' });
+  const server = new McpServer({ name: 'veilcrawl', version: '0.2.0' });
   for (const tool of tools) {
     server.registerTool(tool.name, { description: tool.description, inputSchema: tool.schema.shape }, async (args: any) => {
       try {

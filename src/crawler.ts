@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import type { BrowserContext, Page } from 'playwright';
+import type { BrowserContext, Page, Response } from 'playwright';
 import { launchBrowser, TRACKERS, type BrowserEngine } from './browser.ts';
-import { chunkBlocks, type Block } from './chunker.ts';
+import { chunkBlocks, jsonBlocks, type Block } from './chunker.ts';
+import { embed } from './embed.ts';
 import { VeilError } from './errors.ts';
-import { extractPage, type RawPage } from './extract.ts';
+import { expandPage, extractPage, type RawPage } from './extract.ts';
 import { Redactor, type VeilLevel } from './redactor.ts';
 import { fetchRobots, type Robots } from './robots.ts';
 import { keptVeil, strongest, writeSite, type PageRecord } from './store.ts';
@@ -30,7 +31,7 @@ export interface LocalCrawlOptions {
   audit?(originals: Map<string, string>): void;
 }
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; VeilCrawl/0.1)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; VeilCrawl/0.2)';
 const BLOCKED_TYPES = new Set(['image', 'font', 'media']);
 const NOT_A_PAGE = /\.(?:pdf|zip|gz|tar|dmg|exe|pkg|csv|xlsx?|docx?|pptx?|png|jpe?g|gif|webp|svg|ico|mp[34]|webm|mov|woff2?|css|js|json|xml|rss)$/i;
 
@@ -76,13 +77,30 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
       await sleep(at - Date.now());
     };
 
-    const load = async (url: string): Promise<{ url: string; data: RawPage } | Skip> => {
+    // A selector cannot hide a value inside JSON, and strict sites show as little as possible.
+    const indexApi = veil.veilLevel === 'standard' && !veil.selectors.length;
+    const replies = new Set<string>();
+    const readReply = async (response: Response): Promise<Block[]> => {
+      const url = response.url();
+      const type = response.headers()['content-type'] ?? '';
+      if (!/json/i.test(type) || response.status() >= 400 || Number(response.headers()['content-length']) > 2e6) return [];
+      if (!inScope(url, start) || !(await robotsFor(url)).allowed(url)) return [];
+      const text = await response.text();
+      const hash = createHash('sha256').update(text).digest('hex');
+      if (text.length > 2e6 || replies.has(hash)) return [];
+      replies.add(hash);
+      return jsonBlocks(JSON.parse(text), `API ${redactor.redactUrl(url).replace(/^\w+:\/\/[^/]+/, '').slice(0, 100)}`);
+    };
+
+    const load = async (url: string): Promise<{ url: string; data: RawPage; api: Block[] } | Skip> => {
       if (!(await robotsFor(url)).allowed(url)) return 'robots';
       attempts++;
       let page: Page | undefined;
       try {
         page = await (session.connect ? (await session.connect()).newPage() : context.newPage());
         page.on('popup', (popup) => void popup.close().catch(() => {}));
+        const api: Promise<Block[]>[] = [];
+        if (indexApi) page.on('response', (response) => void (api.length < 30 && api.push(readReply(response).catch(() => []))));
         // After the tab exists: its startup time must not eat into the gap between loads.
         await waitTurn(url);
         const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeout_ms });
@@ -93,10 +111,14 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
         if (!landed || !inScope(landed, start)) return 'off_site';
         if (!(await robotsFor(landed)).allowed(landed)) return 'robots';
         // evaluate has no timeout of its own, and a script that never ends would block it forever.
-        const data = await Promise.race([page.evaluate(extractPage, veil.selectors), sleep(timeout_ms, null, { ref: false })]);
-        if (!data) return 'failed';
-        // A script may have navigated while we were reading.
-        return normalizeUrl(page.url()) === landed ? { url: landed, data } : 'failed';
+        const read = async () => {
+          await page!.evaluate(expandPage, veil.selectors).catch(() => {});
+          return { data: await page!.evaluate(extractPage, veil.selectors), api: (await Promise.all(api)).flat() };
+        };
+        const result = await Promise.race([read(), sleep(timeout_ms, null, { ref: false })]);
+        if (!result) return 'failed';
+        // A script, or a tab we clicked, may have navigated while we were reading.
+        return normalizeUrl(page.url()) === landed ? { url: landed, ...result } : 'failed';
       } catch {
         return 'failed';
       } finally {
@@ -110,6 +132,7 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
     const indexed = new Set<string>();
     const contents = new Set<string>();
     const actionKeys = new Set<string>();
+    const seenText = new Set<string>();
     const pages: (Omit<PageRecord, 'chunks'> & { blocks: Block[] })[] = [];
     const skipped: Partial<Record<Skip, number>> = {};
     const skip = (why: Skip) => (skipped[why] = (skipped[why] ?? 0) + 1);
@@ -121,23 +144,27 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
       const results = await Promise.all(batch.map((item) => load(item.url)));
       results.forEach((result, i) => {
         if (typeof result === 'string') return skip(result);
-        const { data } = result;
-        if (batch[i].depth < args.max_depth) {
-          for (const link of data.links) {
-            const url = normalizeUrl(link);
-            if (!url || url.length > 2000 || !inScope(url, start) || NOT_A_PAGE.test(new URL(url).pathname) || queued.has(urlKey(url))) continue;
-            queued.add(urlKey(url));
-            queue.push({ url, depth: batch[i].depth + 1 });
-          }
-        }
-
+        const { url, data } = result;
         // Canonical links are not trusted: sites point every page of a list at its first page.
-        const { url } = result;
+        // A page with no text and no kind of control that an earlier page lacked is a re-sorted, re-filtered or
+        // out-of-range copy, and its links lead to more of the same, so they are not followed.
         const content = data.blocks.length ? createHash('sha256').update(JSON.stringify(data.blocks)).digest('hex') : url;
-        if (indexed.has(urlKey(url)) || contents.has(content)) return skip('duplicate');
+        const texts = [`title|${data.title}`, ...data.blocks.map((b) => `${b.heading}|${b.text}`), ...data.actions.map((a) => `${a.role}|${a.label}`)];
+        const nothingNew = data.blocks.length && texts.every((t) => seenText.has(t));
+        if (indexed.has(urlKey(url)) || contents.has(content) || nothingNew) return skip('duplicate');
         indexed.add(urlKey(url));
         queued.add(urlKey(url));
         contents.add(content);
+        for (const t of texts) seenText.add(t);
+
+        if (batch[i].depth < args.max_depth) {
+          for (const link of data.links) {
+            const next = normalizeUrl(link);
+            if (!next || next.length > 2000 || !inScope(next, start) || NOT_A_PAGE.test(new URL(next).pathname) || queued.has(urlKey(next))) continue;
+            queued.add(urlKey(next));
+            queue.push({ url: next, depth: batch[i].depth + 1 });
+          }
+        }
 
         rawBytes += data.rawBytes;
         if (data.denied) redactor.counts.SELECTOR = (redactor.counts.SELECTOR ?? 0) + data.denied;
@@ -145,7 +172,7 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
         pages.push({
           url: redactor.redactUrl(url),
           title: redactor.redact(data.title).slice(0, 200),
-          blocks: data.blocks,
+          blocks: [...data.blocks, ...result.api],
           actions: actions.map((a) => ({
             role: redactor.redact(a.role).slice(0, 40),
             label: redactor.redact(a.label).slice(0, 120),
@@ -159,8 +186,9 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
 
     dropRepeatedBlocks(pages);
     const records: PageRecord[] = pages.map(({ blocks, ...page }) => ({ ...page, chunks: chunkBlocks(blocks, redactor) }));
+    const vectors = await embed(records.flatMap((p) => p.chunks.map((c) => `${c.heading}\n${c.text}`)));
     const id = `s_${createHash('sha256').update(urlKey(start)).digest('hex').slice(0, 12)}`;
-    writeSite({ id, host, ...veil, rawBytes, counts: redactor.counts, pages: records });
+    writeSite({ id, host, ...veil, rawBytes, counts: redactor.counts, pages: records, vectors });
     audit?.(redactor.originals);
     return {
       site_id: id,

@@ -109,7 +109,7 @@ async function launchLightpanda(timeoutMs: number): Promise<BrowserSession> {
     '--log-level', 'error',
     '--http-timeout', String(timeoutMs),
     '--http-max-response-size', '20000000',
-    '--user-agent-suffix', 'VeilCrawl/0.1',
+    '--user-agent-suffix', 'VeilCrawl/0.2',
     ...LIGHTPANDA_BLOCK_URLS.flatMap((pattern) => ['--block-urls', pattern]),
   ];
 

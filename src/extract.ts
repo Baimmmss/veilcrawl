@@ -165,3 +165,46 @@ export function extractPage(denySelectors: string[]): RawPage {
 
   return { title: document.title, rawBytes, denied, blocks, actions, links };
 }
+
+/**
+ * Runs inside the page before extractPage: opens <details> and accordions, and copies the panel of every
+ * tab, because only one tab panel shows at a time. Never clicks links, form controls or menus.
+ */
+export async function expandPage(denySelectors: string[]): Promise<void> {
+  const wait = () => new Promise((resolve) => setTimeout(resolve, 100));
+  // Panels a click renders must lose denied parts before they are copied away from the place a selector matches.
+  const deny = () => denySelectors.forEach((s) => document.querySelectorAll(s).forEach((el) => Element.prototype.remove.call(el)));
+  const safe = (el: Element) =>
+    !el.closest('a[href]:not([href^="#"]), form, nav, header, footer, [role=navigation], [role=menu], [role=menubar], [aria-haspopup]:not([aria-haspopup=false])');
+
+  for (const details of document.querySelectorAll('details:not([open])')) (details as HTMLDetailsElement).open = true;
+  const folded = [...document.querySelectorAll<HTMLElement>('[aria-expanded=false][aria-controls]:not([role=tab])')].filter(safe);
+  for (const el of folded.slice(0, 30)) el.click();
+  if (folded.length) await wait();
+
+  const copies = document.createElement('div');
+  let clicks = 0;
+  for (const list of document.querySelectorAll('[role=tablist]')) {
+    const tabs = [...list.querySelectorAll<HTMLElement>('[role=tab]')].filter(safe);
+    const active = tabs.find((t) => t.getAttribute('aria-selected') === 'true') ?? tabs[0];
+    for (const tab of tabs) {
+      if (tab === active || clicks++ >= 24) continue;
+      tab.click();
+      await wait();
+      deny();
+      const panel = document.getElementById(tab.getAttribute('aria-controls') ?? '') ?? list.parentElement?.querySelector('[role=tabpanel]:not([hidden])');
+      if (!panel || panel.hidden) continue;
+      const heading = document.createElement('h3');
+      heading.textContent = tab.textContent;
+      const copy = panel.cloneNode(true) as HTMLElement;
+      copy.removeAttribute('id');
+      copies.append(heading, copy);
+    }
+    active?.click();
+  }
+  if (copies.childElementCount) {
+    await wait();
+    const main = document.querySelectorAll('main, [role=main]');
+    (main.length === 1 ? main[0] : document.body).append(copies);
+  }
+}

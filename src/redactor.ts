@@ -48,7 +48,8 @@ function matchCustom(text: string, regex: RegExp): [number, number][] {
   try {
     return findAll.runInContext(Object.assign(sandbox, { text, regex }), { timeout: 1000 });
   } catch {
-    throw new VeilError(`Redact pattern is too slow: ${regex.source}`);
+    // The pattern is not quoted: it may be a person's saved pattern, and agents read this message.
+    throw new VeilError('A redact pattern is too slow. Saved patterns are in ~/.veilcrawl/veils: delete the site\'s file to reset them.');
   }
 }
 
@@ -82,7 +83,7 @@ function containsCard(match: string): boolean {
   );
 }
 
-const SENSITIVE_PARAM = /token|secret|passw|pwd|signature|session|api_?key|jwt|(?:^|[_-])(?:key|auth|sig|sid|code)$/i;
+export const SENSITIVE_PARAM = /token|secret|passw|pwd|signature|session|api_?key|jwt|(?:^|[_-])(?:key|auth|sig|sid|code)$/i;
 
 /** One instance per crawl, so a value keeps the same placeholder across the whole site. */
 export class Redactor {

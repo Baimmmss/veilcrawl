@@ -44,15 +44,21 @@ test('a veil outlives the index that the weekly cleanup deletes', async () => {
   assert.equal(level(await crawl()), 'strict');
 });
 
-test('an index made before its site got a stronger veil is deleted, not served', async () => {
+test('an index made before its site got a stronger veil is refused, not served', async () => {
   for (const stronger of [{ veil_level: 'strict' as const }, { redact_patterns: ['refund'] }, { redact_selectors: ['h1'] }]) {
     freshHome();
     const weak = await crawl('about');
     const strong = await crawl('', stronger);
     assert.throws(() => level(weak), /Unknown or expired site_id/);
-    assert.ok(!existsSync(file(weak)) && existsSync(file(strong)));
     level(strong);
   }
+});
+
+test('a weaker index is replaced by the next crawl of the same address', async () => {
+  const id = await crawl();
+  await crawl('about', { veil_level: 'strict' });
+  assert.throws(() => level(id), /Unknown or expired site_id/);
+  assert.equal(level(await crawl()), 'strict');
 });
 
 test('one site does not change the veil of another', async () => {
@@ -89,7 +95,7 @@ test('the index file holds no redacted value', async () => {
 test('an index from an older version, which holds redacted values, is deleted on use', async () => {
   const id = await crawl();
   const db = new Database(file(id));
-  db.prepare("UPDATE meta SET json = json_remove(json, '$.host', '$.patterns', '$.selectors')").run();
+  db.prepare("UPDATE meta SET json = json_remove(json, '$.host', '$.patterns', '$.selectors', '$.built')").run();
   db.close();
   assert.throws(() => level(id), /Unknown or expired site_id/);
   assert.ok(!existsSync(file(id)));

@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { VeilError } from './errors.ts';
@@ -13,7 +13,7 @@ export interface PageRecord {
   title: string;
   chunks: { heading: string; text: string }[];
   /** keyHash finds the control again on the live page without storing its unredacted label. */
-  actions: { role: string; label: string; actionType: string; context: string; keyHash?: string }[];
+  actions: { role: string; label: string; actionType: string; context: string; keyHash: string }[];
 }
 
 /** What a crawl hides. */
@@ -25,7 +25,9 @@ export interface Veil {
 
 export interface SiteMeta extends Veil {
   host: string;
-  /** Unique per index file. Missing in indexes made by older versions. */
+  /** Changes when the tables change; an index of another format is deleted when used. */
+  format?: number;
+  /** Unique per index file. */
   built?: string;
   rawBytes: number;
   counts: Record<string, number>;
@@ -45,10 +47,11 @@ export interface SiteRecord extends SiteMeta {
 const SCHEMA = `
   CREATE TABLE meta (json TEXT NOT NULL);
   CREATE TABLE pages (id INTEGER PRIMARY KEY, url TEXT NOT NULL, title TEXT NOT NULL, openable INTEGER NOT NULL);
-  CREATE TABLE chunks (id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL, heading TEXT NOT NULL, text TEXT NOT NULL);
+  CREATE TABLE chunks (id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL, ref TEXT NOT NULL, heading TEXT NOT NULL, text TEXT NOT NULL);
   CREATE INDEX chunks_page ON chunks (page_id);
+  CREATE INDEX chunks_ref ON chunks (ref);
   CREATE VIRTUAL TABLE chunks_fts USING fts5 (title, heading, text, tokenize = 'porter unicode61');
-  CREATE TABLE actions (id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL, action_type TEXT NOT NULL, key_hash TEXT);
+  CREATE TABLE actions (id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL, action_type TEXT NOT NULL, key_hash TEXT NOT NULL);
   -- One blob holds every vector, one signed byte per number: row i belongs to chunk id i + 1. Reading 10k small rows is too slow.
   CREATE TABLE vectors (data BLOB NOT NULL);
   CREATE VIRTUAL TABLE actions_fts USING fts5 (label, context, title, tokenize = 'porter unicode61');
@@ -60,6 +63,13 @@ export function forIndex(text: string): string {
 }
 
 const HOUR = 60 * 60 * 1000;
+const FORMAT = 3;
+
+/**
+ * Chunk ids and action handles come from content, not row numbers, so they mean the same thing after
+ * a re-crawl or a background refresh rebuilds the index while an agent is using it.
+ */
+export const chunkRef = (url: string, heading: string, text: string) => createHash('sha256').update(`${url}\n${heading}\n${text}`).digest('hex').slice(0, 12);
 export const homeDir = () => process.env.VEILCRAWL_HOME ?? join(homedir(), '.veilcrawl');
 
 /** Forgets sites nobody crawled or read for a week, and what a crash left behind (a save takes seconds, not an hour). */
@@ -122,19 +132,19 @@ export function writeSite(site: SiteRecord): void {
     db.exec(SCHEMA);
     const insert = {
       page: db.prepare('INSERT INTO pages (url, title, openable) VALUES (?, ?, ?)'),
-      chunk: db.prepare('INSERT INTO chunks (page_id, heading, text) VALUES (?, ?, ?)'),
+      chunk: db.prepare('INSERT INTO chunks (page_id, ref, heading, text) VALUES (?, ?, ?, ?)'),
       chunkFts: db.prepare('INSERT INTO chunks_fts (rowid, title, heading, text) VALUES (?, ?, ?, ?)'),
       action: db.prepare('INSERT INTO actions (page_id, role, label, action_type, key_hash) VALUES (?, ?, ?, ?, ?)'),
       actionFts: db.prepare('INSERT INTO actions_fts (rowid, label, context, title) VALUES (?, ?, ?, ?)'),
     };
     db.transaction(() => {
       const { id, pages, vectors, ...meta } = site;
-      db.prepare('INSERT INTO meta (json) VALUES (?)').run(JSON.stringify({ ...meta, built: randomUUID(), crawledAt: Date.now() }));
+      db.prepare('INSERT INTO meta (json) VALUES (?)').run(JSON.stringify({ ...meta, format: FORMAT, built: randomUUID(), crawledAt: Date.now() }));
       for (const page of pages) {
         const pageId = insert.page.run(page.url, page.title, page.openable ? 1 : 0).lastInsertRowid;
-        for (const c of page.chunks) insert.chunkFts.run(insert.chunk.run(pageId, c.heading, c.text).lastInsertRowid, forIndex(page.title), forIndex(c.heading), forIndex(c.text));
+        for (const c of page.chunks) insert.chunkFts.run(insert.chunk.run(pageId, chunkRef(page.url, c.heading, c.text), c.heading, c.text).lastInsertRowid, forIndex(page.title), forIndex(c.heading), forIndex(c.text));
         for (const a of page.actions)
-          insert.actionFts.run(insert.action.run(pageId, a.role, a.label, a.actionType, a.keyHash ?? null).lastInsertRowid, forIndex(a.label), forIndex(a.context), forIndex(page.title));
+          insert.actionFts.run(insert.action.run(pageId, a.role, a.label, a.actionType, a.keyHash).lastInsertRowid, forIndex(a.label), forIndex(a.context), forIndex(page.title));
       }
       if (vectors) db.prepare('INSERT INTO vectors VALUES (?)').run(Buffer.from(Int8Array.from(vectors, (x) => Math.round(x * 127)).buffer));
     })();
@@ -198,10 +208,10 @@ export function openSite<T>(siteId: string, use: (db: Database.Database, meta: S
   try {
     const row = db.prepare('SELECT json FROM meta').get() as { json: string };
     const meta = JSON.parse(row.json) as SiteMeta;
-    // Made by an older version: some stored the redacted values, and none has the tables search now reads.
-    if (!meta.built) rmSync(path, { force: true });
+    // Made by another version: some stored the redacted values, and none has the tables this one reads.
+    if (meta.format !== FORMAT) rmSync(path, { force: true });
     // Not deleted: another process may have just swapped a stronger index into this path.
-    if (!meta.built || hidesLess(meta, keptVeil(meta.host))) throw unknownSite();
+    if (meta.format !== FORMAT || hidesLess(meta, keptVeil(meta.host))) throw unknownSite();
     const now = new Date();
     utimesSync(path, now, now);
     return use(db, meta);

@@ -54,11 +54,10 @@ export async function runAction(args: ActArgs) {
   const { meta, steps } = openSite(args.site_id, (db, meta) => ({
     meta,
     steps: args.steps.map((step) => {
-      const id = /^el_[0-9a-z]{1,10}$/.test(step.handle_id) ? parseInt(step.handle_id.slice(3), 36) : 0;
       const row = db
-        .prepare('SELECT a.key_hash AS hash, a.action_type AS type, p.url, p.openable FROM actions a JOIN pages p ON p.id = a.page_id WHERE a.id = ?')
-        .get(id) as { hash: string | null; type: string; url: string; openable: number } | undefined;
-      if (!row?.hash) throw new VeilError(`Unknown handle_id for this site: ${step.handle_id}. Run find_action again.`);
+        .prepare('SELECT a.key_hash AS hash, a.action_type AS type, p.url, p.openable FROM actions a JOIN pages p ON p.id = a.page_id WHERE substr(a.key_hash, 1, 12) = ?')
+        .get(step.handle_id.replace(/^el_/, '')) as { hash: string; type: string; url: string; openable: number } | undefined;
+      if (!row || !step.handle_id.startsWith('el_')) throw new VeilError(`Unknown handle_id for this site: ${step.handle_id}. Run find_action again.`);
       return { ...row, handle: step.handle_id, value: step.value };
     }),
   }));
@@ -76,7 +75,8 @@ export async function runAction(args: ActArgs) {
     for (const step of steps) {
       const index = (step === first ? before : await read()).actions.findIndex((a) => keyHash(a.key) === step.hash);
       if (index < 0) throw new VeilError(`${step.handle} is not on the page now. It may sit in a closed tab, or the site changed: run crawl_site again.`);
-      await read(index);
+      // The page may have added or removed a control since the last read, shifting every position after it.
+      if (keyHash((await read(index)).actions[index]?.key ?? '') !== step.hash) throw new VeilError('The page changed while VeilCrawl was finding the control. Try again.');
       const target = page.locator('[data-veil-target]').first();
       const { tag, type } = await target.evaluate((el) => ({ tag: el.tagName, type: (el as HTMLInputElement).type }));
       if (step.type === 'input' && tag === 'SELECT') await target.selectOption(step.value ?? '', { timeout: 5_000 });

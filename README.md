@@ -133,7 +133,7 @@ veilcrawl direct_search s_0bd11525fdbe open database connection --top_k 1
   "full_matches": 25,
   "hits": [
     {
-      "chunk_id": "c_ce",
+      "chunk_id": "c_5b2e9f0a41d7",
       "url": "https://docs.python.org/3/library/sqlite3.html",
       "title": "sqlite3 — DB-API 2.0 interface for SQLite databases — Pyth…",
       "snippet": "sqlite3 ensures that a transaction is always open, so connect(), Connection.commit(), and …",
@@ -249,7 +249,7 @@ The MCP server and the command line share the same seven tools.
 
 ```sh
 veilcrawl find_action <site_id> contact form
-veilcrawl run_action <site_id> --steps '[{"handle_id":"el_2a","value":"Does it ship to Norway?"},{"handle_id":"el_2c"}]'
+veilcrawl run_action <site_id> --steps '[{"handle_id":"el_3f9a1c0b7e21","value":"Does it ship to Norway?"},{"handle_id":"el_8d04e6b2a915"}]'
 ```
 
 It answers with the new address, its title, whether the page changed address, and only the redacted text that is new, such as `"Thanks! We answer within a day at [EMAIL_1]."`.

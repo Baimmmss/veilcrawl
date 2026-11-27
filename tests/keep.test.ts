@@ -92,10 +92,10 @@ test('the index file holds no redacted value', async () => {
   for (const s of SECRETS) assert.ok(!bytes.includes(s), `stored: ${s}`);
 });
 
-test('an index from an older version, which holds redacted values, is deleted on use', async () => {
+test('an index from an older version, which may hold redacted values or lack tables, is deleted on use', async () => {
   const id = await crawl();
   const db = new Database(file(id));
-  db.prepare("UPDATE meta SET json = json_remove(json, '$.host', '$.patterns', '$.selectors', '$.built')").run();
+  db.prepare("UPDATE meta SET json = json_remove(json, '$.format')").run();
   db.close();
   assert.throws(() => level(id), /Unknown or expired site_id/);
   assert.ok(!existsSync(file(id)));

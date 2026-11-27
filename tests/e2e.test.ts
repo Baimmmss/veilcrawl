@@ -96,7 +96,7 @@ test('identifies itself honestly', () => {
 
 test('no secret reaches the agent through any tool, and none is searchable', async () => {
   const id = crawl.site_id;
-  for (const { id: n } of rows(id, 'SELECT id FROM chunks')) await call('peek_chunk', { site_id: id, chunk_id: `c_${n.toString(36)}`, window: 1 });
+  for (const { ref } of rows(id, 'SELECT ref FROM chunks')) await call('peek_chunk', { site_id: id, chunk_id: `c_${ref}`, window: 1 });
   for (const s of SECRETS) {
     await call('direct_search', { site_id: id, query: s, top_k: 20, max_tokens: 2000 });
     await call('find_action', { site_id: id, intent: s, top_k: 20 });

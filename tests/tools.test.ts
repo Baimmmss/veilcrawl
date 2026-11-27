@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { before, test } from 'node:test';
 
 process.env.VEILCRAWL_HOME = mkdtempSync(join(tmpdir(), 'veil-'));
-const { writeSite } = await import('../src/store.ts');
+const { chunkRef, writeSite } = await import('../src/store.ts');
 const { tools } = await import('../src/tools.ts');
 const { estimateTokens } = await import('../src/budget.ts');
 
@@ -20,10 +20,12 @@ const site = (id: string, veilLevel: 'standard' | 'strict', pages: number, perPa
   pages: Array.from({ length: pages }, (_, p) => ({
     url: `https://x.com/docs/section-${p % 20}/page-${p}`, title: `Guide ${p}`,
     chunks: Array.from({ length: perPage }, (_, c) => ({ heading: `Topic ${c}`, text: `Passage ${c} of guide ${p} explains widget configuration and limits. ${'Extra filler words follow here. '.repeat(7)}` })),
-    actions: [{ role: 'button', label: `Export CSV ${p}`, actionType: 'click', context: 'Reports' }],
+    actions: [{ role: 'button', label: `Export CSV ${p}`, actionType: 'click', context: 'Reports', keyHash: `${id}${p}`.padEnd(32, '0') }],
   })),
 });
 const A = 's_aaaaaaaaaaaa', S = 's_bbbbbbbbbbbb', BIG = 's_cccccccccccc';
+/** chunk_id of the first chunk of a test site, worked out without opening it. */
+const firstChunk = (id: string) => { const p = site(id, 'standard', 1, 1).pages[0]; return `c_${chunkRef(p.url, p.chunks[0].heading, p.chunks[0].text)}`; };
 
 before(() => {
   const a = site(A, 'standard', 3, 4);
@@ -71,7 +73,7 @@ test('peek_chunk returns neighbours only from the same page', async () => {
   const near = await call('peek_chunk', { site_id: A, chunk_id: hits[0].chunk_id, window: 1 });
   assert.ok(near.chunks.length >= 2 && near.chunks.length <= 3);
   assert.ok(near.chunks.some((c: any) => /Refunds/.test(c.text)));
-  assert.equal((await call('peek_chunk', { site_id: A, chunk_id: 'c_1', window: 1 })).chunks.every((c: any) => /guide 0/.test(c.text)), true);
+  assert.equal((await call('peek_chunk', { site_id: A, chunk_id: firstChunk(A), window: 1 })).chunks.every((c: any) => /guide 0/.test(c.text)), true);
 });
 test('strict mode caps text at 120 chars and hides titles in the map', async () => {
   const r = await call('direct_search', { site_id: S, query: 'widget', max_tokens: 1000 });
@@ -92,7 +94,7 @@ test('unknown or malicious ids give a clear error', async () => {
 test('searches languages written without spaces', async () => {
   const id = 's_eeeeeeeeeeee';
   const texts = ['退款政策为三十天。', '返金ポリシーは三十日です。', 'นโยบายการคืนเงินสามสิบวัน', '환불은 삼십일 이내에 가능합니다.', 'Plain English refunds.'];
-  writeSite({ ...site(id, 'standard', 1, 0), pages: texts.map((text, i) => ({ url: `https://x.com/${i}`, title: `T${i}`, chunks: [{ heading: '', text }], actions: [{ role: 'button', label: text, actionType: 'click', context: '' }] })) });
+  writeSite({ ...site(id, 'standard', 1, 0), pages: texts.map((text, i) => ({ url: `https://x.com/${i}`, title: `T${i}`, chunks: [{ heading: '', text }], actions: [{ role: 'button', label: text, actionType: 'click', context: '', keyHash: `k${i}`.padEnd(32, '0') }] })) });
   for (const [query, expected] of [['退款', 0], ['三十天', 0], ['ポリシー', 1], ['คืนเงิน', 2], ['환불', 3], ['refund', 4]] as const) {
     const r = await call('direct_search', { site_id: id, query });
     assert.equal(r.hits[0]?.snippet, texts[expected], query);
@@ -132,7 +134,7 @@ test('an index untouched for a week is deleted, and one used within the week is 
   assert.ok(!exists('s_111111111111.db') && exists('s_222222222222.db'));
 });
 test('every way of reading a site counts as touching it', async () => {
-  for (const [name, args] of [['direct_search', { query: 'widget' }], ['find_action', { intent: 'export' }], ['site_map', {}], ['peek_chunk', { chunk_id: 'c_1' }], ['veil_audit', {}]] as const) {
+  for (const [name, args] of [['direct_search', { query: 'widget' }], ['find_action', { intent: 'export' }], ['site_map', {}], ['peek_chunk', { chunk_id: firstChunk('s_333333333333') }], ['veil_audit', {}]] as const) {
     make('s_333333333333', 6.9);
     await call(name, { site_id: 's_333333333333', ...args });
     assert.ok(Date.now() - statSync(join(process.env.VEILCRAWL_HOME!, 's_333333333333.db')).mtimeMs < 60_000, name);

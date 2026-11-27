@@ -18,8 +18,10 @@ const { tools } = await import('../src/tools.ts');
 const { startDashboard } = await import('../src/dashboard.ts');
 
 const escape = (s: string) => s.replace(/[<>&"]/g, (c) => `&#${c.charCodeAt(0)};`);
+// Set to put a new control and passage first on the page, which renumbers every row of the next index.
+let extra = '';
 const pages: Record<string, (q: URLSearchParams) => string> = {
-  '/': () => `<main><h1>Contact</h1>
+  '/': () => `<main>${extra}<h1>Contact</h1>
     <form action="/thanks"><label>Your name <input name="name"></label><label>Email <input name="email"></label>
     <select name="topic" aria-label="Topic"><option>Sales</option><option>Support</option></select><button>Send message</button></form>
     <button id="tip" type="button">Show tip</button><p id="out"></p><a href="/u/ann@example.com">Ann</a></main>
@@ -137,5 +139,19 @@ test('the dashboard marks hidden values on the live page, escapes page text, and
     assert.equal(status, 403);
   } finally {
     dash.close();
+  }
+});
+
+test('handles and chunk ids keep their meaning after the index is rebuilt', async () => {
+  const { site_id } = await crawl();
+  const tip = await handle(site_id, 'show tip');
+  const hit = (await call('direct_search', { site_id, query: 'contact', top_k: 1 })).hits[0];
+  extra = '<p>New banner text first.</p><button type="button">New first button</button>';
+  try {
+    await crawl();
+    assert.deepEqual((await call('run_action', { site_id, steps: [{ handle_id: tip }] })).changed, ['Tips are free on Fridays.']);
+    assert.equal((await call('peek_chunk', { site_id, chunk_id: hit.chunk_id })).chunks[0].text, hit.snippet);
+  } finally {
+    extra = '';
   }
 });

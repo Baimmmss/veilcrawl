@@ -27,7 +27,6 @@ function termsOf(query: string): string[] {
 }
 
 const ftsQuery = (terms: string[], operator: 'AND' | 'OR') => terms.map((t) => `"${forIndex(t)}"`).join(` ${operator} `);
-const chunkId = (id: number) => `c_${id.toString(36)}`;
 
 function tool<S extends z.ZodObject>(
   name: string,
@@ -75,16 +74,16 @@ export const tools = [
         // Reciprocal rank fusion: near the top of either list ranks high, in both lists ranks higher.
         const scores = new Map<number, number>();
         for (const list of [keyword, similar]) list.forEach((id, rank) => scores.set(id, (scores.get(id) ?? 0) + 1 / (61 + rank)));
-        const get = db.prepare('SELECT p.url, p.title, c.text FROM chunks c JOIN pages p ON p.id = c.page_id WHERE c.id = ?');
+        const get = db.prepare('SELECT p.url, p.title, c.ref, c.text FROM chunks c JOIN pages p ON p.id = c.page_id WHERE c.id = ?');
         const rows = [...scores]
           .sort((a, b) => b[1] - a[1])
           .slice(0, args.top_k)
-          .map(([id, score]) => ({ id, score, ...(get.get(id) as { url: string; title: string; text: string }) }));
+          .map(([id, score]) => ({ id, score, ...(get.get(id) as { url: string; title: string; ref: string; text: string }) }));
         const { n } = db.prepare('SELECT count(*) AS n FROM chunks_fts WHERE chunks_fts MATCH ?').get(ftsQuery(terms, 'AND')) as { n: number };
         return fitBudget(rows, args.max_tokens, meta.veilLevel === 'strict' ? 120 : 280, (items, chars) => ({
           full_matches: n,
           hits: items.map((r) => ({
-            chunk_id: chunkId(r.id),
+            chunk_id: `c_${r.ref}`,
             url: snippet(r.url, 120),
             title: snippet(r.title, 60),
             snippet: snippet(r.text, chars, terms),
@@ -106,15 +105,15 @@ export const tools = [
         const rows = terms.length
           ? (db
               .prepare(
-                `SELECT a.id, p.url, a.role, a.label, a.action_type
+                `SELECT a.key_hash, p.url, a.role, a.label, a.action_type
                  FROM actions_fts JOIN actions a ON a.id = actions_fts.rowid JOIN pages p ON p.id = a.page_id
                  WHERE actions_fts MATCH ? ORDER BY bm25(actions_fts, 5, 1, 1) LIMIT ?`,
               )
-              .all(ftsQuery(terms, 'OR'), args.top_k) as { id: number; url: string; role: string; label: string; action_type: string }[])
+              .all(ftsQuery(terms, 'OR'), args.top_k) as { key_hash: string; url: string; role: string; label: string; action_type: string }[])
           : [];
         return fitBudget(rows, FIND_ACTION_TOKENS, meta.veilLevel === 'strict' ? 60 : 80, (items, chars) => ({
           actions: items.map((r) => ({
-            handle_id: `el_${r.id.toString(36)}`,
+            handle_id: `el_${r.key_hash.slice(0, 12)}`,
             url: snippet(r.url, 120),
             role: r.role,
             label: snippet(r.label, chars, terms),
@@ -181,15 +180,15 @@ export const tools = [
     z.object({ site_id: siteId, chunk_id: z.string(), window: z.coerce.number().int().min(0).max(1).default(0) }),
     (args) =>
       openSite(args.site_id, (db, meta) => {
-        const id = /^c_[0-9a-z]{1,10}$/.test(args.chunk_id) ? parseInt(args.chunk_id.slice(2), 36) : 0;
-        const target = db.prepare('SELECT page_id, heading FROM chunks WHERE id = ?').get(id) as { page_id: number; heading: string } | undefined;
-        if (!target) throw new VeilError('Unknown chunk_id for this site.');
+        const target = db.prepare('SELECT id, page_id, heading FROM chunks WHERE ref = ?').get(args.chunk_id.slice(2)) as { id: number; page_id: number; heading: string } | undefined;
+        if (!target || !args.chunk_id.startsWith('c_')) throw new VeilError('Unknown chunk_id for this site. Search again: the site may have changed.');
+        const { id } = target;
         const rows = db
-          .prepare('SELECT id, text FROM chunks WHERE page_id = ? AND id BETWEEN ? AND ? ORDER BY id = ? DESC, id')
-          .all(target.page_id, id - args.window, id + args.window, id) as { id: number; text: string }[];
+          .prepare('SELECT id, ref, text FROM chunks WHERE page_id = ? AND id BETWEEN ? AND ? ORDER BY id = ? DESC, id')
+          .all(target.page_id, id - args.window, id + args.window, id) as { id: number; ref: string; text: string }[];
         return fitBudget(rows, PEEK_TOKENS, meta.veilLevel === 'strict' ? 120 : 300, (items, chars) => ({
           heading: snippet(target.heading, 80),
-          chunks: items.toSorted((a, b) => a.id - b.id).map((r) => ({ chunk_id: chunkId(r.id), text: snippet(r.text, chars) })),
+          chunks: items.toSorted((a, b) => a.id - b.id).map((r) => ({ chunk_id: `c_${r.ref}`, text: snippet(r.text, chars) })),
         }));
       }),
   ),

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { runAction } from './act.ts';
 import { estimateTokens, fitBudget, snippet } from './budget.ts';
 import { crawlSite, type LocalCrawlOptions } from './crawler.ts';
 import { VeilError } from './errors.ts';
@@ -121,6 +122,22 @@ export const tools = [
           })),
         }));
       }),
+  ),
+
+  tool(
+    'run_action',
+    'Use controls from find_action, in order, on the live page: click, type a value, pick an option or submit. Acts as a visitor without a login. Returns only the redacted text that changed.',
+    ['site_id'],
+    z.object({
+      site_id: siteId,
+      steps: z
+        .array(z.object({ handle_id: z.string(), value: z.string().max(2000).optional().describe('Text to type or option to pick') }))
+        .min(1)
+        .max(10)
+        .describe('All on one page visit, e.g. type a name, then press Send'),
+      max_tokens: maxTokens(SEARCH_TOKENS),
+    }),
+    runAction,
   ),
 
   tool(

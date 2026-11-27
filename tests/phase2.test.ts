@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, symlinkSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { tmpdir } from 'node:os';
+import { cpus, loadavg, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { after, before, beforeEach, test } from 'node:test';
 
@@ -36,7 +36,15 @@ const api = `<main><h1>Catalog</h1><p>Loading the catalog.</p></main><script>
   fetch('/graphql', { method: 'POST', body: '{}' }).then((r) => r.json());
   </script>`;
 
+const hashTabs = `<main><h1>Hash tabs</h1><div role="tablist"><a role="tab" href="#/one" aria-selected="true" aria-controls="h1">One</a><a role="tab" href="#/two" aria-selected="false" aria-controls="h2">Two</a></div>
+  <div role="tabpanel" id="h1"><p>First hash panel.</p></div><div role="tabpanel" id="h2" hidden><p>Second hash panel.</p></div></main>
+  <script>document.querySelectorAll('[role=tab]').forEach((t) => t.addEventListener('click', () => document.querySelectorAll('[role=tabpanel]').forEach((p) => (p.hidden = p.id !== t.getAttribute('aria-controls')))));</script>`;
+const live = '<main><p>Live dashboard text.</p></main><script>fetch("/live").then((r) => r.body.getReader().read())</script>';
+const shell = (n: number) => `<main><p>Loading the shop.</p><a href="/shell/${3 - n}">other</a></main><script>fetch("/api/shell/${n}").then((r) => r.json())</script>`;
+
 const json: Record<string, unknown> = {
+  '/api/shell/1': { product: 'Iron teapot' },
+  '/api/shell/2': { product: 'Glass teapot' },
   '/api/items': { items: [{ name: 'Copper kettle', price: 49, owner: 'ann@example.com', api_key: 'APIKEYVALUE', blob: 'Z'.repeat(300) }] },
   '/private/api': { note: 'ROBOTSBLOCKED' },
   '/graphql': { data: { shop: { motto: 'Tea for everyone' } } },
@@ -56,9 +64,11 @@ before(async () => {
     hits.push(req.url!);
     const path = req.url!.split('?')[0];
     if (path === '/robots.txt') return void res.writeHead(200, { 'content-type': 'text/plain' }).end('User-agent: *\nDisallow: /private');
+    if (path === '/live') return void res.writeHead(200, { 'content-type': 'application/x-ndjson' }).write('{"tick":1}\n');
     if (json[path]) return void res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(json[path]));
     const kettle = (colour: string) => `<main><h1>${colour} kettle</h1><p>Boils a litre in two minutes.</p><a href="/kettle/blue">blue</a></main>`;
-    const body = { '/tabs': tabs, '/api': api, '/list': list(new URL(req.url!, 'http://x').searchParams.get('sort') ?? 'asc'), '/kettle/red': kettle('Red'), '/kettle/blue': kettle('Blue') }[path];
+    const body = { '/tabs': tabs, '/api': api, '/list': list(new URL(req.url!, 'http://x').searchParams.get('sort') ?? 'asc'), '/kettle/red': kettle('Red'), '/kettle/blue': kettle('Blue'),
+      '/hashtabs': hashTabs, '/stream': live, '/shell/1': shell(1), '/shell/2': shell(2) }[path];
     res.writeHead(body ? 200 : 404, { 'content-type': 'text/html' }).end(body ?? '');
   });
   await new Promise<void>((r) => server.listen(0, r));
@@ -91,6 +101,24 @@ for (const engine of ['lightpanda', 'chromium'] as const) {
   });
 }
 
+for (const engine of ['lightpanda', 'chromium'] as const) {
+  test(`${engine}: tabs that change the address, and JSON streams that never end, do not lose the page`, async (t) => {
+    const probe = await launchBrowser(engine).catch(() => null);
+    if (!probe) return t.skip(`${engine} is not installed`);
+    await probe.close();
+    assert.match(text((await crawl('hashtabs', { max_pages: 1 }, { engine })).site_id), /First hash panel.*Second hash panel/);
+    const started = performance.now();
+    assert.match(text((await crawl('stream', { max_pages: 1 }, { engine, timeout_ms: 8000 })).site_id), /Live dashboard text/);
+    assert.ok(performance.now() - started < 7000, 'waited for the stream');
+  });
+}
+
+test('pages that differ only in their API data are both kept', async () => {
+  const { site_id, pages_indexed } = await crawl('shell/1');
+  assert.equal(pages_indexed, 2);
+  assert.match(text(site_id), /Iron teapot.*Glass teapot|Glass teapot.*Iron teapot/);
+});
+
 test('JSON replies are left out on strict sites and sites with redact selectors', async () => {
   for (const [path, extra] of [['api?strict', { veil_level: 'strict' }], ['api?selectors', { redact_selectors: ['.none'] }]] as const) {
     freshHome();
@@ -110,7 +138,7 @@ test('pages that differ only in their heading are both kept', async () => {
   assert.equal((await crawl('kettle/red')).pages_indexed, 2);
 });
 
-test('direct_search finds a passage by meaning and stays under 100 ms P95 with vectors', { timeout: 600_000 }, async () => {
+test('direct_search finds a passage by meaning and stays under 100 ms P95 with vectors', { timeout: 600_000 }, async (t) => {
   // A cache that outlives the test home, so the model is downloaded once per checkout.
   const models = resolve('node_modules/.cache/veilcrawl-models');
   mkdirSync(models, { recursive: true });
@@ -140,6 +168,8 @@ test('direct_search finds a passage by meaning and stays under 100 ms P95 with v
       vectors,
     });
     await ask('s_feedfeedfeed', 'warmup');
+    // A machine running more than it has cores measures its own load, not VeilCrawl.
+    if (loadavg()[0] > cpus().length) return t.skip(`machine too busy to time (load ${loadavg()[0].toFixed(0)})`);
     const times: number[] = [];
     for (let i = 0; i < 40; i++) {
       const at = performance.now();

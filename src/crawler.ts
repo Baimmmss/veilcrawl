@@ -1,14 +1,14 @@
 import { createHash } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { BrowserContext, Page, Response } from 'playwright';
-import { launchBrowser, TRACKERS, type BrowserEngine } from './browser.ts';
+import { launchBrowser, TRACKERS, type BrowserEngine, type BrowserSession } from './browser.ts';
 import { chunkBlocks, jsonBlocks, type Block } from './chunker.ts';
-import { embed } from './embed.ts';
+import { DIMS, embed } from './embed.ts';
 import { VeilError } from './errors.ts';
 import { expandPage, extractPage, type RawPage } from './extract.ts';
 import { Redactor, type VeilLevel } from './redactor.ts';
 import { fetchRobots, type Robots } from './robots.ts';
-import { keptVeil, strongest, writeSite, type PageRecord } from './store.ts';
+import { keptVeil, openSite, previousChunks, strongest, writeSite, type PageRecord } from './store.ts';
 import { inScope, normalizeUrl, siteOf, urlKey } from './url.ts';
 
 export interface CrawlArgs {
@@ -31,7 +31,7 @@ export interface LocalCrawlOptions {
   audit?(originals: Map<string, string>): void;
 }
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; VeilCrawl/0.2)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; VeilCrawl/0.3)';
 const BLOCKED_TYPES = new Set(['image', 'font', 'media']);
 const NOT_A_PAGE = /\.(?:pdf|zip|gz|tar|dmg|exe|pkg|csv|xlsx?|docx?|pptx?|png|jpe?g|gif|webp|svg|ico|mp[34]|webm|mov|woff2?|css|js|json|xml|rss)$/i;
 
@@ -50,13 +50,8 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
   const redactor = new Redactor(veil.veilLevel, veil.patterns);
 
   const session = await launchBrowser(engine, timeout_ms);
-  const { browser } = session;
   try {
-    const context =
-      session.engine === 'lightpanda'
-        ? await browser.newContext()
-        : await browser.newContext({ userAgent: USER_AGENT, serviceWorkers: 'block', acceptDownloads: false });
-    if (session.engine === 'chromium') await blockAssets(context);
+    const context = await newContext(session);
     await checkSelectors(context, veil.selectors);
 
     const robotsByOrigin = new Map<string, Promise<Robots>>();
@@ -100,7 +95,9 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
         page = await (session.connect ? (await session.connect()).newPage() : context.newPage());
         page.on('popup', (popup) => void popup.close().catch(() => {}));
         const api: Promise<Block[]>[] = [];
-        if (indexApi) page.on('response', (response) => void (api.length < 30 && api.push(readReply(response).catch(() => []))));
+        // A stream that never ends (live updates, long polling) must not hold up the page.
+        const reply = (response: Response) => Promise.race([readReply(response).catch(() => []), sleep(2000, [], { ref: false })]);
+        if (indexApi) page.on('response', (response) => void (api.length < 30 && api.push(reply(response))));
         // After the tab exists: its startup time must not eat into the gap between loads.
         await waitTurn(url);
         const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeout_ms });
@@ -113,7 +110,7 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
         // evaluate has no timeout of its own, and a script that never ends would block it forever.
         const read = async () => {
           await page!.evaluate(expandPage, veil.selectors).catch(() => {});
-          return { data: await page!.evaluate(extractPage, veil.selectors), api: (await Promise.all(api)).flat() };
+          return { data: await page!.evaluate(extractPage, { deny: veil.selectors }), api: (await Promise.all(api)).flat() };
         };
         const result = await Promise.race([read(), sleep(timeout_ms, null, { ref: false })]);
         if (!result) return 'failed';
@@ -130,7 +127,6 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
     const queue = [{ url: start, depth: 0 }];
     const queued = new Set([urlKey(start)]);
     const indexed = new Set<string>();
-    const contents = new Set<string>();
     const actionKeys = new Set<string>();
     const seenText = new Set<string>();
     const pages: (Omit<PageRecord, 'chunks'> & { blocks: Block[] })[] = [];
@@ -146,15 +142,15 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
         if (typeof result === 'string') return skip(result);
         const { url, data } = result;
         // Canonical links are not trusted: sites point every page of a list at its first page.
-        // A page with no text and no kind of control that an earlier page lacked is a re-sorted, re-filtered or
-        // out-of-range copy, and its links lead to more of the same, so they are not followed.
-        const content = data.blocks.length ? createHash('sha256').update(JSON.stringify(data.blocks)).digest('hex') : url;
-        const texts = [`title|${data.title}`, ...data.blocks.map((b) => `${b.heading}|${b.text}`), ...data.actions.map((a) => `${a.role}|${a.label}`)];
-        const nothingNew = data.blocks.length && texts.every((t) => seenText.has(t));
-        if (indexed.has(urlKey(url)) || contents.has(content) || nothingNew) return skip('duplicate');
+        // A page with no text, API row or kind of control that an earlier page lacked is an alias, or a re-sorted,
+        // re-filtered or out-of-range copy, and its links lead to more of the same, so they are not followed.
+        // The title does not count: aliases often change only that.
+        const blocks = [...data.blocks, ...result.api];
+        const texts = [...blocks.map((b) => `${b.heading}|${b.text}`), ...data.actions.map((a) => `${a.role}|${a.label}`)];
+        const nothingNew = blocks.length && texts.every((t) => seenText.has(t));
+        if (indexed.has(urlKey(url)) || nothingNew) return skip('duplicate');
         indexed.add(urlKey(url));
         queued.add(urlKey(url));
-        contents.add(content);
         for (const t of texts) seenText.add(t);
 
         if (batch[i].depth < args.max_depth) {
@@ -169,15 +165,18 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
         rawBytes += data.rawBytes;
         if (data.denied) redactor.counts.SELECTOR = (redactor.counts.SELECTOR ?? 0) + data.denied;
         const actions = data.actions.filter((a) => !actionKeys.has(a.key) && actionKeys.add(a.key));
+        const shown = redactor.redactUrl(url);
         pages.push({
-          url: redactor.redactUrl(url),
+          url: shown,
+          openable: shown === url,
           title: redactor.redact(data.title).slice(0, 200),
-          blocks: [...data.blocks, ...result.api],
+          blocks,
           actions: actions.map((a) => ({
             role: redactor.redact(a.role).slice(0, 40),
             label: redactor.redact(a.label).slice(0, 120),
             actionType: a.actionType,
             context: redactor.redact(a.context).slice(0, 120),
+            keyHash: keyHash(a.key),
           })),
         });
       });
@@ -186,14 +185,29 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
 
     dropRepeatedBlocks(pages);
     const records: PageRecord[] = pages.map(({ blocks, ...page }) => ({ ...page, chunks: chunkBlocks(blocks, redactor) }));
-    const vectors = await embed(records.flatMap((p) => p.chunks.map((c) => `${c.heading}\n${c.text}`)));
     const id = `s_${createHash('sha256').update(urlKey(start)).digest('hex').slice(0, 12)}`;
-    writeSite({ id, host, ...veil, rawBytes, counts: redactor.counts, pages: records, vectors });
+    // Unchanged chunks keep their vectors, so a re-crawl only embeds what changed.
+    const texts = records.flatMap((p) => p.chunks.map((c) => `${c.heading}\n${c.text}`));
+    const known = previousChunks(id);
+    const unchanged = texts.filter((t) => known.has(t)).length;
+    const missing = [...new Set(texts.filter((t) => !known.get(t)))];
+    const fresh = await embed(missing);
+    missing.forEach((t, i) => fresh && known.set(t, fresh.subarray(i * DIMS, (i + 1) * DIMS)));
+    let vectors: Float32Array | null = null;
+    if (texts.every((t) => known.get(t))) {
+      vectors = new Float32Array(texts.length * DIMS);
+      texts.forEach((t, i) => vectors!.set(known.get(t)!, i * DIMS));
+    }
+    // A start address with a hidden value is not stored, so such a site is not refreshed by itself.
+    const crawl = new Redactor(veil.veilLevel, veil.patterns).redactUrl(start) === start ? { url: start, maxPages: args.max_pages, maxDepth: args.max_depth } : null;
+    writeSite({ id, host, ...veil, rawBytes, counts: redactor.counts, pages: records, vectors, crawl });
     audit?.(redactor.originals);
     return {
       site_id: id,
       pages_indexed: records.length,
-      chunks_count: records.reduce((n, p) => n + p.chunks.length, 0),
+      chunks_count: texts.length,
+      unchanged_chunks: unchanged,
+      semantic_search: !!vectors,
       actions_count: records.reduce((n, p) => n + p.actions.length, 0),
       redactions_applied: redactor.counts,
       skipped,
@@ -201,6 +215,37 @@ export async function crawlSite(args: CrawlArgs, local: LocalCrawlOptions = {}) 
   } finally {
     await session.close();
   }
+}
+
+/** A browser context that identifies as VeilCrawl and, on Chromium, skips images, fonts, trackers and frames. */
+export async function newContext(session: BrowserSession): Promise<BrowserContext> {
+  if (session.engine === 'lightpanda') return session.browser.newContext();
+  const context = await session.browser.newContext({ userAgent: USER_AGENT, serviceWorkers: 'block', acceptDownloads: false });
+  await blockAssets(context);
+  return context;
+}
+
+/** Stored instead of an action's key, which holds its unredacted label. */
+export const keyHash = (key: string) => createHash('sha256').update(key).digest('hex').slice(0, 32);
+
+const DAY = 24 * 60 * 60 * 1000;
+const lastRefresh = new Map<string, number>();
+
+// shortcut: each MCP server process refreshes on its own, so two agents on one stale site crawl it twice; add a lock file if that matters.
+/** Crawls a site again in the background when an agent uses an index a day old. Tries at most once an hour per site. */
+export function refreshIfStale(siteId: string): void {
+  if (Date.now() - (lastRefresh.get(siteId) ?? 0) < DAY / 24) return;
+  let crawl: { url: string; maxPages: number; maxDepth: number } | null | undefined;
+  try {
+    crawl = openSite(siteId, (_, meta) => (Date.now() - (meta.crawledAt ?? 0) > DAY ? meta.crawl : null));
+  } catch {
+    return;
+  }
+  if (!crawl) return;
+  lastRefresh.set(siteId, Date.now());
+  // The saved veil and VEILCRAWL_VEIL still apply, so asking for standard here never weakens it.
+  const args = { url: crawl.url, max_pages: crawl.maxPages, max_depth: crawl.maxDepth, veil_level: 'standard' as const, redact_patterns: [], redact_selectors: [] };
+  crawlSite(args).catch((error) => console.error(`VeilCrawl could not refresh ${siteId}: ${(error as Error).message}`));
 }
 
 async function blockAssets(context: BrowserContext): Promise<void> {

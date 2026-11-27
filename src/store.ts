@@ -8,9 +8,12 @@ import type { VeilLevel } from './redactor.ts';
 
 export interface PageRecord {
   url: string;
+  /** True when `url` had nothing redacted, so it is the real address and run_action may open it. */
+  openable?: boolean;
   title: string;
   chunks: { heading: string; text: string }[];
-  actions: { role: string; label: string; actionType: string; context: string }[];
+  /** keyHash finds the control again on the live page without storing its unredacted label. */
+  actions: { role: string; label: string; actionType: string; context: string; keyHash?: string }[];
 }
 
 /** What a crawl hides. */
@@ -26,6 +29,9 @@ export interface SiteMeta extends Veil {
   built?: string;
   rawBytes: number;
   counts: Record<string, number>;
+  /** What to crawl again to refresh the index; null when the start address had a hidden value. */
+  crawl?: { url: string; maxPages: number; maxDepth: number } | null;
+  crawledAt?: number;
 }
 
 /** Page content in here is already redacted. */
@@ -38,11 +44,11 @@ export interface SiteRecord extends SiteMeta {
 
 const SCHEMA = `
   CREATE TABLE meta (json TEXT NOT NULL);
-  CREATE TABLE pages (id INTEGER PRIMARY KEY, url TEXT NOT NULL, title TEXT NOT NULL);
+  CREATE TABLE pages (id INTEGER PRIMARY KEY, url TEXT NOT NULL, title TEXT NOT NULL, openable INTEGER NOT NULL);
   CREATE TABLE chunks (id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL, heading TEXT NOT NULL, text TEXT NOT NULL);
   CREATE INDEX chunks_page ON chunks (page_id);
   CREATE VIRTUAL TABLE chunks_fts USING fts5 (title, heading, text, tokenize = 'porter unicode61');
-  CREATE TABLE actions (id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL, action_type TEXT NOT NULL);
+  CREATE TABLE actions (id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL, action_type TEXT NOT NULL, key_hash TEXT);
   -- One blob holds every vector, one signed byte per number: row i belongs to chunk id i + 1. Reading 10k small rows is too slow.
   CREATE TABLE vectors (data BLOB NOT NULL);
   CREATE VIRTUAL TABLE actions_fts USING fts5 (label, context, title, tokenize = 'porter unicode61');
@@ -115,20 +121,20 @@ export function writeSite(site: SiteRecord): void {
     chmodSync(temp, 0o600);
     db.exec(SCHEMA);
     const insert = {
-      page: db.prepare('INSERT INTO pages (url, title) VALUES (?, ?)'),
+      page: db.prepare('INSERT INTO pages (url, title, openable) VALUES (?, ?, ?)'),
       chunk: db.prepare('INSERT INTO chunks (page_id, heading, text) VALUES (?, ?, ?)'),
       chunkFts: db.prepare('INSERT INTO chunks_fts (rowid, title, heading, text) VALUES (?, ?, ?, ?)'),
-      action: db.prepare('INSERT INTO actions (page_id, role, label, action_type) VALUES (?, ?, ?, ?)'),
+      action: db.prepare('INSERT INTO actions (page_id, role, label, action_type, key_hash) VALUES (?, ?, ?, ?, ?)'),
       actionFts: db.prepare('INSERT INTO actions_fts (rowid, label, context, title) VALUES (?, ?, ?, ?)'),
     };
     db.transaction(() => {
       const { id, pages, vectors, ...meta } = site;
-      db.prepare('INSERT INTO meta (json) VALUES (?)').run(JSON.stringify({ ...meta, built: randomUUID() }));
+      db.prepare('INSERT INTO meta (json) VALUES (?)').run(JSON.stringify({ ...meta, built: randomUUID(), crawledAt: Date.now() }));
       for (const page of pages) {
-        const pageId = insert.page.run(page.url, page.title).lastInsertRowid;
+        const pageId = insert.page.run(page.url, page.title, page.openable ? 1 : 0).lastInsertRowid;
         for (const c of page.chunks) insert.chunkFts.run(insert.chunk.run(pageId, c.heading, c.text).lastInsertRowid, forIndex(page.title), forIndex(c.heading), forIndex(c.text));
         for (const a of page.actions)
-          insert.actionFts.run(insert.action.run(pageId, a.role, a.label, a.actionType).lastInsertRowid, forIndex(a.label), forIndex(a.context), forIndex(page.title));
+          insert.actionFts.run(insert.action.run(pageId, a.role, a.label, a.actionType, a.keyHash ?? null).lastInsertRowid, forIndex(a.label), forIndex(a.context), forIndex(page.title));
       }
       if (vectors) db.prepare('INSERT INTO vectors VALUES (?)').run(Buffer.from(Int8Array.from(vectors, (x) => Math.round(x * 127)).buffer));
     })();
@@ -162,6 +168,25 @@ export function nearest(db: Database.Database, meta: SiteMeta, query: Float32Arr
     if (sum / 127 >= minSimilarity) best.push({ id: row + 1, sim: sum });
   }
   return best.sort((a, b) => b.sim - a.sim).slice(0, limit).map((b) => b.id);
+}
+
+/** Chunks of the current index of a site as "heading\ntext", with their vector if it has one. Empty when there is none. */
+export function previousChunks(siteId: string): Map<string, Float32Array | null> {
+  const chunks = new Map<string, Float32Array | null>();
+  try {
+    openSite(siteId, (db) => {
+      const blob = db.prepare('SELECT data FROM vectors').pluck().get() as Buffer | undefined;
+      const rows = db.prepare('SELECT id, heading, text FROM chunks ORDER BY id').all() as { id: number; heading: string; text: string }[];
+      const dims = blob && rows.length ? blob.length / rows.length : 0;
+      for (const r of rows) {
+        const at = (r.id - 1) * dims;
+        chunks.set(`${r.heading}\n${r.text}`, blob ? Float32Array.from(new Int8Array(blob.buffer, blob.byteOffset + at, dims), (x) => x / 127) : null);
+      }
+    });
+  } catch {
+    // No usable index yet: everything is new.
+  }
+  return chunks;
 }
 
 export function openSite<T>(siteId: string, use: (db: Database.Database, meta: SiteMeta) => T): T {

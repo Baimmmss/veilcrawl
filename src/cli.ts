@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
+import { startDashboard } from './dashboard.ts';
 import { VeilError } from './errors.ts';
 import { runMcpServer } from './mcp.ts';
 import { tools } from './tools.ts';
@@ -19,11 +20,17 @@ function usage(): string {
     return `  veilcrawl ${t.name} ${t.positional.map((p) => `<${p}>`).join(' ')} ${flags.map((f) => `[--${f}]`).join(' ')}`.trimEnd();
   });
   return [
-    'Usage:', ...lines, '  veilcrawl mcp', '',
+    'Usage:', ...lines, '  veilcrawl mcp', '  veilcrawl dashboard', '',
     `crawl_site also takes ${Object.keys(localOptions.shape).map((k) => `--${k}`).join(' ')}`,
     'crawl_site --audit shows the redacted values themselves (terminal only, never saved)',
+    'dashboard serves a local page that compares what the agent sees with the live page (terminal only)',
   ].join('\n');
 }
+
+// Keeps piped agent shells out; it is not an access control.
+const requireTerminal = (what: string) => {
+  if (!(process.stdin.isTTY && process.stdout.isTTY)) throw new VeilError(`${what} shows private values and only runs in an interactive terminal.`);
+};
 
 function printAudit(originals: Map<string, string>): void {
   // Values come from web pages: control characters could drive the terminal.
@@ -34,6 +41,11 @@ async function main(argv: string[]): Promise<void> {
   const [name, ...rest] = argv;
   if (!name || name === 'help' || name === '--help') return console.log(usage());
   if (name === 'mcp') return runMcpServer();
+  if (name === 'dashboard') {
+    requireTerminal('dashboard');
+    const { url } = await startDashboard();
+    return console.log(`VeilCrawl dashboard (anyone with this link can see hidden values; Ctrl-C stops it):\n${url}`);
+  }
   const tool = tools.find((t) => t.name === name);
   if (!tool) throw new VeilError(`Unknown command: ${name}\n${usage()}`);
 
@@ -51,9 +63,10 @@ async function main(argv: string[]): Promise<void> {
     const value = last ? positionals.slice(i).join(' ') : positionals[i];
     if (value) input[key] = value;
   });
+  // run_action takes a list of steps, which a command line passes as JSON.
+  if (typeof input.steps === 'string') input.steps = JSON.parse(input.steps);
   const args = tool.schema.parse(input) as any;
-  // Keeps piped agent shells out; it is not an access control.
-  if (values.audit && !(process.stdin.isTTY && process.stdout.isTTY)) throw new VeilError('--audit shows private values and only runs in an interactive terminal.');
+  if (values.audit) requireTerminal('--audit');
   const local = { ...localOptions.parse(input), audit: values.audit ? printAudit : undefined };
   const result = await tool.run(args, isCrawl ? local : undefined);
   console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));

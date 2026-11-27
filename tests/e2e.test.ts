@@ -43,7 +43,7 @@ before(async () => {
 after(async () => { await client.close(); site.close(); });
 
 test('crawl_site returns statistics only', () => {
-  assert.deepEqual(Object.keys(crawl).sort(), ['actions_count', 'chunks_count', 'pages_indexed', 'redactions_applied', 'site_id', 'skipped']);
+  assert.deepEqual(Object.keys(crawl).sort(), ['actions_count', 'chunks_count', 'pages_indexed', 'redactions_applied', 'semantic_search', 'site_id', 'skipped', 'unchanged_chunks']);
   assert.equal(crawl.pages_indexed, rows(crawl.site_id, 'SELECT * FROM pages').length);
   assert.ok(crawl.redactions_applied.EMAIL >= 7 && crawl.redactions_applied.CUSTOM >= 1 && crawl.redactions_applied.SELECTOR >= 1);
 });
@@ -117,9 +117,9 @@ test('search costs at least 95% fewer tokens than the raw HTML', async () => {
   assert.ok(estimateTokens(JSON.stringify(r)) <= raw_html_tokens * 0.05);
 });
 
-test('MCP offers the six tools and no way to disable robots', async () => {
+test('MCP offers the seven tools and no way to disable robots', async () => {
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 6);
+  assert.equal(tools.length, 7);
   assert.deepEqual(Object.keys(tools[0].inputSchema.properties!), ['url', 'max_pages', 'max_depth', 'veil_level', 'redact_patterns', 'redact_selectors']);
 });
 

@@ -18,8 +18,11 @@ export interface RawPage {
   links: string[];
 }
 
-/** Runs inside the page, so it must not reference anything outside its own body. Output is NOT redacted. */
-export function extractPage(denySelectors: string[]): RawPage {
+/**
+ * Runs inside the page, so it must not reference anything outside its own body. Output is NOT redacted.
+ * `mark` tags the control at that position in `actions` with data-veil-target, so run_action can use it.
+ */
+export function extractPage({ deny: denySelectors, mark = -1 }: { deny: string[]; mark?: number }): RawPage {
   const rawBytes = new Blob([document.documentElement.outerHTML]).size;
   const clean = (s: string | null | undefined) => (s ?? '').replace(/\s+/g, ' ').trim();
 
@@ -28,6 +31,7 @@ export function extractPage(denySelectors: string[]): RawPage {
     ...[...root.querySelectorAll('*')].flatMap((el) => (el.shadowRoot instanceof ShadowRoot ? deepAll(selector, el.shadowRoot) : [])),
   ];
 
+  for (const el of deepAll('[data-veil-target]')) Element.prototype.removeAttribute.call(el, 'data-veil-target');
   let denied = 0;
   for (const selector of denySelectors) {
     for (const el of deepAll(selector)) {
@@ -114,6 +118,7 @@ export function extractPage(denySelectors: string[]): RawPage {
     const role = el.getAttribute('role') ?? { A: 'link', BUTTON: 'button', FORM: 'form', SELECT: 'combobox', SUMMARY: 'button' }[tag] ?? (actionType === 'input' ? 'textbox' : 'button');
     // Links and page chrome repeat on every page; other controls belong to the page they are on.
     const scope = href || (inChrome(el) ? 'chrome' : location.href);
+    if (actions.length === mark) Element.prototype.setAttribute.call(el, 'data-veil-target', '');
     actions.push({ role, label, actionType, context: headingFor(el), key: [role, label, scope].join('|') });
   }
 
@@ -171,6 +176,8 @@ export function extractPage(denySelectors: string[]): RawPage {
  * tab, because only one tab panel shows at a time. Never clicks links, form controls or menus.
  */
 export async function expandPage(denySelectors: string[]): Promise<void> {
+  // Tabs such as <a href="#/two"> change the address; the page must still be read under the one it loaded at.
+  const address = location.href;
   const wait = () => new Promise((resolve) => setTimeout(resolve, 100));
   // Panels a click renders must lose denied parts before they are copied away from the place a selector matches.
   const deny = () => denySelectors.forEach((s) => document.querySelectorAll(s).forEach((el) => Element.prototype.remove.call(el)));
@@ -207,4 +214,5 @@ export async function expandPage(denySelectors: string[]): Promise<void> {
     const main = document.querySelectorAll('main, [role=main]');
     (main.length === 1 ? main[0] : document.body).append(copies);
   }
+  if (location.href !== address) history.replaceState(history.state, '', address);
 }

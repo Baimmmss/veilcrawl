@@ -11,7 +11,7 @@ Crawl once, index locally, and answer with small, redacted snippets.
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
 ![Browser: Lightpanda](https://img.shields.io/badge/browser-Lightpanda-F5A623)
 ![MCP server](https://img.shields.io/badge/MCP-server-6E56CF)
-![Status: early](https://img.shields.io/badge/status-early%20(v0.2)-orange)
+![Status: early](https://img.shields.io/badge/status-early%20(v0.3)-orange)
 
 [Quick start](#quick-start) · [Use cases](#use-cases) · [Tools](#tools) · [How it works](#how-it-works) · [Privacy](#privacy) · [Configuration](#configuration)
 
@@ -44,7 +44,7 @@ VeilCrawl uses [Lightpanda](https://lightpanda.io), a lightweight headless brows
 brew install lightpanda-io/browser/lightpanda
 ```
 
-**Linux (x86_64) and WSL2**
+**Linux and WSL2** (use `lightpanda-aarch64-linux` on ARM)
 
 ```sh
 mkdir -p ~/.local/bin
@@ -53,16 +53,18 @@ chmod a+x ~/.local/bin/lightpanda
 ~/.local/bin/lightpanda version
 ```
 
-Other platforms: see the [Lightpanda nightly builds](https://github.com/lightpanda-io/browser/releases/tag/nightly).
+**Windows:** Lightpanda has no Windows build. Use Chromium (below), or run VeilCrawl inside WSL2.
 
 <details>
 <summary><b>Prefer Chromium?</b></summary>
 
-Skip the step above and run this after `npm install`. VeilCrawl uses Chromium when Lightpanda is not installed.
+Skip the step above and run this after installing VeilCrawl. VeilCrawl uses Chromium when Lightpanda is not installed.
 
 ```sh
 npx playwright install chromium --only-shell
 ```
+
+On Linux, add `--with-deps` so the system libraries Chromium needs are installed too.
 
 </details>
 
@@ -73,6 +75,9 @@ npm install -g veilcrawl
 ```
 
 This includes local semantic search, which adds about 230 MB of runtime. To skip it and search by words only, add `--omit=optional`.
+
+> [!IMPORTANT]
+> **On Linux x64, install with `ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm install -g veilcrawl`.** Without it, the model runtime tries to download GPU files from an address that no longer exists. npm then drops semantic search without an error. Every `crawl_site` result shows `semantic_search: true` or `false`, so you can check.
 
 <details>
 <summary><b>From source</b></summary>
@@ -223,21 +228,31 @@ veilcrawl direct_search s_87a1bc3e9425 事务 --top_k 1
 ### Where it does not fit
 
 - **Pages behind a login:** VeilCrawl does not sign in.
-- **Clicking or filling in forms:** it finds controls but cannot use them yet. It opens tabs and accordions while crawling, and nothing else.
+- **Long tasks in a web app:** each `run_action` call is one fresh visit without cookies, so there is no session between calls. Put every step of one task in one call.
 - **Meaning in other languages:** semantic search uses an English model. Other languages are searched by words only.
 
 ## Tools
 
-The MCP server and the command line share the same six tools.
+The MCP server and the command line share the same seven tools.
 
 | Tool | What it does | Main options |
 | :--- | :--- | :--- |
 | `crawl_site` | Crawls and indexes a site. Returns statistics, never content. | `max_pages` 50 · `max_depth` 3 · `veil_level` · `redact_patterns` · `redact_selectors` |
 | `direct_search` | Searches every indexed page, by words and by meaning. | `top_k` 5 · `max_tokens` 250 |
 | `find_action` | Finds buttons, links, forms and downloads. | `top_k` 5 |
+| `run_action` | Uses controls by handle on the live page: types, picks options, clicks and submits. Returns only what changed, redacted. | `steps` (up to 10) · `max_tokens` 250 |
 | `site_map` | Shows a compact tree of routes. | `max_tokens` 200 |
 | `peek_chunk` | Reads one search hit, with its neighbours if asked. | `window` 0 or 1 |
 | `veil_audit` | Reports redaction counts and tokens saved per search. | |
+
+`run_action` takes every step of one task at once, because each call is a fresh visit. From the command line, pass the steps as JSON:
+
+```sh
+veilcrawl find_action <site_id> contact form
+veilcrawl run_action <site_id> --steps '[{"handle_id":"el_2a","value":"Does it ship to Norway?"},{"handle_id":"el_2c"}]'
+```
+
+It answers with the new address, its title, whether the page changed address, and only the redacted text that is new, such as `"Thanks! We answer within a day at [EMAIL_1]."`.
 
 ## How it works
 
@@ -285,9 +300,22 @@ To see what was hidden, add `--audit` to `crawl_site`. It prints the hidden valu
 > - The agent chooses `veil_level` the first time it crawls a site, unless you set `VEILCRAWL_VEIL=strict`.
 > - Settings belong to one host and port. The same pages under another name, such as a subdomain or an IP address, are a separate site.
 > - API replies often hold more than the page shows. They are indexed only on `standard` sites without `redact_selectors`, because a selector cannot hide a value inside JSON. Use `strict`, or any `redact_selectors`, to keep them out.
+> - `run_action` lets the agent do anything a visitor without a login can: send contact forms, sign up for newsletters, add things to a basket. It refuses only pages whose address held a hidden value. Don't connect VeilCrawl to an agent you would not let browse for you.
 > - Hidden values are not saved, but an agent with shell access can read the redacted index and your `redact_patterns`, delete the saved settings, or open the site without VeilCrawl.
 
 The first crawl downloads the 23 MB search model from Hugging Face into `~/.veilcrawl/models`. It sends no page content and no queries. After that, VeilCrawl works offline. If the download fails, search falls back to matching words.
+
+### Dashboard
+
+```sh
+veilcrawl dashboard
+```
+
+This prints a private link to a local page. It lists your sites, their token savings, hidden-value counts and site map, and for each page shows **what the agent can read next to the real page, with hidden values marked**. The real page is loaded again when you open it, and nothing is saved. The dashboard serves only `127.0.0.1`, runs no scripts, and works only in an interactive terminal. Anyone who has the link can see hidden values while it runs, so press Ctrl-C when done.
+
+### Staying fresh
+
+Running `crawl_site` again rebuilds the index, and reuses the meaning vectors of every passage that did not change. `unchanged_chunks` in the result says how many. When an agent uses an index that is more than a day old, the MCP server crawls the site again in the background with the same limits and veil, at most once an hour per site. A site whose start address held a hidden value is not refreshed by itself.
 
 Indexes are stored in `~/.veilcrawl`. A site that nobody crawls or reads for 7 days is deleted the next time VeilCrawl is used. Delete `<site_id>.db` to forget a site sooner. The settings in `veils` are kept until you delete them. Indexes made by an older version are deleted when used, so crawl those sites again.
 
@@ -349,7 +377,7 @@ npm run build
 
 `npm test` turns semantic search off, except in one test that downloads the model once into `node_modules/.cache`.
 
-To release, bump `version` in `package.json` and `src/mcp.ts`, then run `npm test` and `npm publish`. Publishing builds `dist` first.
+To release, bump `version` in `package.json` and `src/mcp.ts`, then run `npm test` and `npm publish`. Publishing builds `dist` first. The latency tests skip themselves when the machine's load is higher than its number of cores.
 
 `npm audit` in a project that installs VeilCrawl reports `sharp`, an image library that the search model's package requires. VeilCrawl never decodes images. Transformers 4, which fixes this, no longer runs on Intel Macs. Install with `--omit=optional` to leave it out.
 
@@ -357,7 +385,7 @@ To release, bump `version` in `package.json` and `src/mcp.ts`, then run `npm tes
 
 - [x] **Phase 1:** crawler, local search, redaction, MCP server and CLI
 - [x] **Phase 2:** semantic search, API response indexing, tab and accordion expansion, duplicate-loop skipping
-- [ ] **Phase 3:** running actions through handles, incremental crawls, local dashboard
+- [x] **Phase 3:** running actions through handles, background refresh with reuse of unchanged passages, local dashboard
 
 See [PRD.md](PRD.md) for the full plan.
 
